@@ -39,11 +39,12 @@ import numpy as np
 import os
 import sys
 import time as wall_time
+from scipy.spatial import cKDTree
 
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "/mnt/user-data/outputs"
+OUTPUT_DIR = "../data_sph/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -68,7 +69,7 @@ m_vG    = 1.0 - 1.0 / n_vG                    # Van Genuchten m
 g_a     = gamma_w / p_caw0                     # alpha_vG  [1/m]
 
 S_sat   = 1.0
-S_res   = 0.02
+S_res   = 0.045
 g_l     = 0.5          # Mualem pore-connectivity parameter
 
 # Specific storage  (paper Eq. 30)
@@ -170,8 +171,6 @@ def dW_dr(r):
 support_r = 2.0 * h_sml
 
 print("Building neighbour lists (cKDTree) ...", flush=True)
-
-from scipy.spatial import cKDTree
 
 tree = cKDTree(np.column_stack([xp, yp]))
 nbl  = tree.query_ball_tree(tree, r=support_r)      # list of lists
@@ -857,10 +856,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 2000          # adjust as needed
-snapshot_every = 200
-print_every    = 100
-ckpt_every     = 500
+N_steps_max    = 1000000          # adjust as needed
+snapshot_every = 1000
+print_every    = 500
+ckpt_every     = snapshot_every*5
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
