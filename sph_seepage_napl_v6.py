@@ -41,10 +41,11 @@ import sys
 import time as wall_time
 from scipy.spatial import cKDTree
 
+
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph"
+OUTPUT_DIR = "../data_sph/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -893,6 +894,53 @@ if ckpt is not None:
     Sn_max_log     = list(ckpt["Sn_max_log"])
     napl_mass_log      = list(ckpt["napl_mass_log"])
     napl_mass_nosrc_log = list(ckpt["napl_mass_nosrc_log"])
+
+    # --- Purge stale data from future of the checkpoint ---
+    # If a previous run wrote snapshots/checkpoints past the checkpoint
+    # step before being killed, those are from a trajectory that will be
+    # overwritten.  Remove them now to avoid an inconsistent history.
+    ckpt_step = int(ckpt["step"])
+
+    # Purge stale HDF5 snapshot groups
+    if HAS_H5 and os.path.exists(hdf5_path):
+        n_purged = 0
+        with h5py.File(hdf5_path, "a") as f:
+            stale = [k for k in f.keys()
+                     if k.startswith("step_")
+                     and int(k.split("_")[1]) > ckpt_step]
+            for k in stale:
+                del f[k]
+                n_purged += 1
+        if n_purged > 0:
+            print(f"  Purged {n_purged} stale snapshot(s) "
+                  f"(step > {ckpt_step}) from {hdf5_path}")
+            # Repack to reclaim dead space left by deleted groups
+            import shutil, subprocess
+            tmp_path = hdf5_path + ".repack"
+            try:
+                result = subprocess.run(
+                    ["h5repack", hdf5_path, tmp_path],
+                    capture_output=True, timeout=120)
+                if result.returncode == 0:
+                    shutil.move(tmp_path, hdf5_path)
+                    print(f"  Repacked {hdf5_path} (dead space reclaimed)")
+                else:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    # Purge stale checkpoint files past the restart point
+    import glob
+    for pat in ["ckpt_*.h5", "ckpt_*.npz"]:
+        for cp_path in glob.glob(os.path.join(CKPT_DIR, pat)):
+            base = os.path.basename(cp_path)
+            cp_step = int(base.split("_")[1].split(".")[0])
+            if cp_step > ckpt_step:
+                os.remove(cp_path)
+                print(f"  Removed stale checkpoint: {base}")
+
 else:
     start_step = 1
     t_phys     = 0.0
