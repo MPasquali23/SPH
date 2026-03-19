@@ -44,7 +44,7 @@ from scipy.spatial import cKDTree
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph/"
+OUTPUT_DIR = "../data_sph"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -743,29 +743,28 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt, qx, qy):
         grp.create_dataset("ptype", data=ptype)
         grp.create_dataset("is_source", data=is_source.astype(np.int8))
 
-# Remove stale file if present
-if HAS_H5 and os.path.exists(hdf5_path):
-    os.remove(hdf5_path)
+# NOTE: snapshot file is NOT deleted on restart — new groups are appended
+# so the full time history is preserved across SLURM job submissions.
 
 
 # ======================================================================
-# 12b. CHECKPOINT SAVE / LOAD  (HDF5 for restart — HPC-friendly)
+# 12b. CHECKPOINT SAVE / LOAD  (individual HDF5 files — HPC/SLURM)
 # ======================================================================
 #
-# Single HDF5 file with one group per checkpoint.  Each group stores
-# the full simulation state: fields (h_w, S_n), scalar metadata
-# (step, t_phys), and convergence history arrays.  HDF5 advantages
-# over NPZ on HPC: chunked compression, parallel I/O (h5py + mpi4py),
-# single-file management, and portable self-describing metadata.
+# Each checkpoint is a separate HDF5 file:  ckpt_00001000.h5
+# This avoids corruption from interrupted writes to a single file
+# (e.g. SLURM wall-time kill), and allows easy cleanup of old checkpoints.
+# Each file is self-contained: fields, metadata, and full history arrays.
 
-CKPT_PATH = os.path.join(OUTPUT_DIR, "checkpoints.h5")
+CKPT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+os.makedirs(CKPT_DIR, exist_ok=True)
 
 def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
                     Sn_max_log, napl_mass_log, napl_mass_nosrc_log):
-    """Append a checkpoint group to the HDF5 checkpoint file."""
+    """Save full simulation state to an individual HDF5 checkpoint file."""
     if not HAS_H5:
         # Fallback: NPZ if h5py unavailable
-        path = os.path.join(OUTPUT_DIR, f"ckpt_{step:08d}.npz")
+        path = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.npz")
         np.savez_compressed(path, step=step, t_phys=t, h_w=hw, S_n=Sn,
             time_log=np.array(time_log), l2_log=np.array(l2_log),
             l2n_log=np.array(l2n_log), Sn_max_log=np.array(Sn_max_log),
@@ -774,73 +773,92 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
         print(f"    checkpoint saved (NPZ fallback): {path}")
         return
 
-    mode = "a" if os.path.exists(CKPT_PATH) else "w"
-    with h5py.File(CKPT_PATH, mode) as f:
-        grp_name = f"ckpt_{step:08d}"
-        if grp_name in f:
-            del f[grp_name]
-        grp = f.create_group(grp_name)
+    path = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.h5")
+    with h5py.File(path, "w") as f:
+        # Scalar metadata as attributes on root
+        f.attrs["step"]    = step
+        f.attrs["t_phys"]  = t
+        f.attrs["Nx"]      = Nx
+        f.attrs["Ny"]      = Ny
+        f.attrs["Lx"]      = Lx
+        f.attrs["Ly"]      = Ly
+        f.attrs["k_sat"]   = k_sat
+        f.attrs["k_sat_n"] = k_sat_n
+        f.attrs["H_u"]     = H_u
+        f.attrs["H_d"]     = H_d
 
-        # Scalar metadata
-        grp.attrs["step"]   = step
-        grp.attrs["t_phys"] = t
-        grp.attrs["Nx"]     = Nx
-        grp.attrs["Ny"]     = Ny
-        grp.attrs["Lx"]     = Lx
-        grp.attrs["Ly"]     = Ly
-        grp.attrs["k_sat"]  = k_sat
-        grp.attrs["k_sat_n"] = k_sat_n
-        grp.attrs["H_u"]    = H_u
-        grp.attrs["H_d"]    = H_d
-
-        # Field arrays (chunked + compressed for large grids)
+        # Field arrays (compressed)
         ckw = dict(compression="gzip", compression_opts=4)
-        grp.create_dataset("h_w", data=hw, **ckw)
-        grp.create_dataset("S_n", data=Sn, **ckw)
+        f.create_dataset("h_w", data=hw, **ckw)
+        f.create_dataset("S_n", data=Sn, **ckw)
 
         # Convergence history
-        grp.create_dataset("time_log",           data=np.array(time_log))
-        grp.create_dataset("l2_log",             data=np.array(l2_log))
-        grp.create_dataset("l2n_log",            data=np.array(l2n_log))
-        grp.create_dataset("Sn_max_log",         data=np.array(Sn_max_log))
-        grp.create_dataset("napl_mass_log",      data=np.array(napl_mass_log))
-        grp.create_dataset("napl_mass_nosrc_log", data=np.array(napl_mass_nosrc_log))
+        f.create_dataset("time_log",            data=np.array(time_log))
+        f.create_dataset("l2_log",              data=np.array(l2_log))
+        f.create_dataset("l2n_log",             data=np.array(l2n_log))
+        f.create_dataset("Sn_max_log",          data=np.array(Sn_max_log))
+        f.create_dataset("napl_mass_log",       data=np.array(napl_mass_log))
+        f.create_dataset("napl_mass_nosrc_log", data=np.array(napl_mass_nosrc_log))
 
-    print(f"    checkpoint saved: {CKPT_PATH}::{grp_name}")
+    print(f"    checkpoint saved: {path}")
 
 
 def load_latest_checkpoint():
-    """Load most recent checkpoint from HDF5 file.
-    Returns dict-like object or None if no checkpoint found.
+    """Scan checkpoint directory for the most recent file.
+    Tries HDF5 first, then NPZ fallback.
+    Returns dict or None.
     """
     import glob
 
-    # Try HDF5 first
-    if HAS_H5 and os.path.exists(CKPT_PATH):
-        with h5py.File(CKPT_PATH, "r") as f:
-            groups = sorted([k for k in f.keys() if k.startswith("ckpt_")])
-            if groups:
-                grp = f[groups[-1]]
-                d = {
-                    "step":    int(grp.attrs["step"]),
-                    "t_phys":  float(grp.attrs["t_phys"]),
-                    "h_w":     grp["h_w"][:],
-                    "S_n":     grp["S_n"][:],
-                    "time_log":           grp["time_log"][:],
-                    "l2_log":             grp["l2_log"][:],
-                    "l2n_log":            grp["l2n_log"][:],
-                    "Sn_max_log":         grp["Sn_max_log"][:],
-                    "napl_mass_log":      grp["napl_mass_log"][:],
-                    "napl_mass_nosrc_log": grp["napl_mass_nosrc_log"][:],
-                }
-                print(f"  Restarting from checkpoint: {CKPT_PATH}::{groups[-1]}")
-                print(f"    step = {d['step']},  t = {d['t_phys']:.4e} s")
-                return d
+    # Scan for HDF5 checkpoints
+    h5_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.h5")))
+    # Scan for NPZ checkpoints
+    npz_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.npz")))
 
-    # Fallback: try NPZ files
-    npz_files = sorted(glob.glob(os.path.join(OUTPUT_DIR, "ckpt_*.npz")))
-    if npz_files:
-        path = npz_files[-1]
+    # Pick the latest across both formats
+    latest_h5  = h5_files[-1]  if h5_files  else None
+    latest_npz = npz_files[-1] if npz_files else None
+
+    # Extract step numbers to compare
+    def step_from_path(p):
+        base = os.path.basename(p)       # ckpt_00001000.h5
+        num  = base.split("_")[1].split(".")[0]  # 00001000
+        return int(num)
+
+    # Determine which is more recent
+    path = None
+    fmt  = None
+    if latest_h5 and latest_npz:
+        if step_from_path(latest_h5) >= step_from_path(latest_npz):
+            path, fmt = latest_h5, "h5"
+        else:
+            path, fmt = latest_npz, "npz"
+    elif latest_h5:
+        path, fmt = latest_h5, "h5"
+    elif latest_npz:
+        path, fmt = latest_npz, "npz"
+    else:
+        return None
+
+    if fmt == "h5" and HAS_H5:
+        with h5py.File(path, "r") as f:
+            d = {
+                "step":    int(f.attrs["step"]),
+                "t_phys":  float(f.attrs["t_phys"]),
+                "h_w":     f["h_w"][:],
+                "S_n":     f["S_n"][:],
+                "time_log":            f["time_log"][:],
+                "l2_log":              f["l2_log"][:],
+                "l2n_log":             f["l2n_log"][:],
+                "Sn_max_log":          f["Sn_max_log"][:],
+                "napl_mass_log":       f["napl_mass_log"][:],
+                "napl_mass_nosrc_log": f["napl_mass_nosrc_log"][:],
+            }
+        print(f"  Restarting from checkpoint: {path}")
+        print(f"    step = {d['step']},  t = {d['t_phys']:.4e} s")
+        return d
+
+    elif fmt == "npz":
         d_raw = np.load(path, allow_pickle=True)
         d = {k: d_raw[k] for k in d_raw.files}
         d["step"]   = int(d["step"])
@@ -856,10 +874,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 1000000          # adjust as needed
-snapshot_every = 1000
-print_every    = 500
-ckpt_every     = snapshot_every*5
+N_steps_max    = 4000          # adjust as needed
+snapshot_every = 200
+print_every    = 100
+ckpt_every     = 500
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
@@ -1259,7 +1277,7 @@ print(f"  k_sat (NAPL)                  = {k_sat_n:.6e} m/s")
 print(f"  Expected q_w ~ k_sat*dH/Lx   = {q_expected:.6e} m/s")
 if HAS_H5:
     print(f"  HDF5 snapshots                = {hdf5_path}")
-print(f"  Checkpoints                   = {CKPT_PATH}")
+print(f"  Checkpoints                   = {CKPT_DIR}/")
 print(f"{'='*70}")
 
 plt.close("all")
