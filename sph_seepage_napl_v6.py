@@ -874,10 +874,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 4000          # adjust as needed
-snapshot_every = 200
-print_every    = 100
-ckpt_every     = 500
+N_steps_max    = 1000000          # adjust as needed
+snapshot_every = 1000
+print_every    = 500
+ckpt_every     = 10*snapshot_every
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
