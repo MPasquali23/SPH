@@ -52,7 +52,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "/mnt/user-data/outputs"
+OUTPUT_DIR = "../data_sph"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -77,7 +77,7 @@ m_vG    = 1.0 - 1.0 / n_vG                    # Van Genuchten m
 g_a     = gamma_w / p_caw0                     # alpha_vG  [1/m]
 
 S_sat   = 1.0
-S_res   = 0.02
+S_res   = 0.045
 g_l     = 0.5          # Mualem pore-connectivity parameter
 
 # Specific storage  (paper Eq. 30)
@@ -946,10 +946,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 2000          # adjust as needed
-snapshot_every = 200
-print_every    = 100
-ckpt_every     = 500
+N_steps_max    = 50000          # adjust as needed
+snapshot_every = 1000
+print_every    = 1000
+ckpt_every     = 10*snapshot_every
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
