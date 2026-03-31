@@ -49,11 +49,11 @@ def find_snapshot_file(argv):
     candidates += [
         "sph_napl_snapshots.h5",
         os.path.join("outputs", "sph_napl_snapshots.h5"),
-        os.path.join("../sph_hpc/data_sph", "sph_napl_snapshots.h5"),
+        os.path.join("../data_sph/omp", "sph_napl_snapshots.h5"),
         # NPZ directory fallback
         "snapshots",
         os.path.join("outputs", "snapshots"),
-        os.path.join("../sph_hpc/data_sph", "snapshots"),
+        os.path.join("../data_sph/omp", "snapshots"),
     ]
     for path in candidates:
         if os.path.exists(path):

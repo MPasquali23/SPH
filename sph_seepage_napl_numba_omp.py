@@ -52,7 +52,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph"
+OUTPUT_DIR = "../data_sph/omp"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -946,7 +946,7 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 50000          # adjust as needed
+N_steps_max    = 500000          # adjust as needed
 snapshot_every = 1000
 print_every    = 1000
 ckpt_every     = 10*snapshot_every
