@@ -37,7 +37,6 @@ Output
 
 import numpy as np
 import os
-import sys
 import time as wall_time
 
 try:
@@ -116,11 +115,16 @@ print(f"alpha_aw = {g_a:.4f}  alpha_nw = {alpha_nw:.4f}  1/m")
 # 2.  DOMAIN  &  SPH DISCRETISATION
 # ======================================================================
 Lx, Ly = 10.0, 10.0
-
-Nx = 51       # particles in x
-Ny = 51       # particles in y
-dx = Lx / (Nx - 1)
-dy = Ly / (Ny - 1)
+import sys
+if "--nx" in sys.argv:
+    idx = sys.argv.index("--nx")
+    Nx = Ny = int(sys.argv[idx + 1])
+    dx = Lx / (Nx - 1)
+    dy = Ly / (Ny - 1)
+#Nx = 501       # particles in x
+#Ny = 51       # particles in y
+#dx = Lx / (Nx - 1)
+#dy = Ly / (Ny - 1)
 
 print(f"\nDomain  {Lx} x {Ly} m    grid  {Nx} x {Ny}    "
       f"dx = {dx:.4f} m    dy = {dy:.4f} m")
@@ -740,7 +744,7 @@ def compute_darcy_velocity_napl(h_field, Sn_field):
 # ======================================================================
 # 11.  TIME STEP   [Paper Eq. 66 / Appendix A.17]
 # ======================================================================
-CFL = 0.1
+CFL = 0.25
 
 def stable_dt(h_field, Sn_field):
     Cs = compute_Cs(h_field)
@@ -946,7 +950,7 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 500000          # adjust as needed
+N_steps_max    = 50000          # adjust as needed
 snapshot_every = 1000
 print_every    = 1000
 ckpt_every     = 10*snapshot_every
