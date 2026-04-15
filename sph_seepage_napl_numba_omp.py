@@ -37,6 +37,7 @@ Output
 
 import numpy as np
 import os
+import sys
 import time as wall_time
 
 try:
@@ -51,7 +52,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph/omp"
+OUTPUT_DIR = "../data_sph/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -115,16 +116,11 @@ print(f"alpha_aw = {g_a:.4f}  alpha_nw = {alpha_nw:.4f}  1/m")
 # 2.  DOMAIN  &  SPH DISCRETISATION
 # ======================================================================
 Lx, Ly = 10.0, 10.0
-import sys
-if "--nx" in sys.argv:
-    idx = sys.argv.index("--nx")
-    Nx = Ny = int(sys.argv[idx + 1])
-    dx = Lx / (Nx - 1)
-    dy = Ly / (Ny - 1)
-#Nx = 501       # particles in x
-#Ny = 51       # particles in y
-#dx = Lx / (Nx - 1)
-#dy = Ly / (Ny - 1)
+
+Nx = 51       # particles in x
+Ny = 51       # particles in y
+dx = Lx / (Nx - 1)
+dy = Ly / (Ny - 1)
 
 print(f"\nDomain  {Lx} x {Ly} m    grid  {Nx} x {Ny}    "
       f"dx = {dx:.4f} m    dy = {dy:.4f} m")
@@ -479,15 +475,11 @@ print(f"\nParticle types:  interior={n_int}  left={n_left}  "
 # adjustment, then *plateau* at a small numerical residual once the true
 # steady state is reached - that plateau is the signal of convergence.
 
-h_w = np.zeros(N_part)
-for i in range(N_part):
-    H_guess = H_u + (H_d - H_u) * xp[i] / Lx
-    h_w[i]  = H_guess - yp[i]
+h_w = H_u + (H_d - H_u) * xp / Lx - yp      # vectorised
 
-# Enforce Dirichlet BCs on left/right
-for i in range(N_part):
-    if ptype[i] == 1:  h_w[i] = H_u - yp[i]
-    if ptype[i] == 2:  h_w[i] = H_d - yp[i]
+# Enforce Dirichlet BCs on left/right (vectorised)
+h_w[ptype == 1] = H_u - yp[ptype == 1]
+h_w[ptype == 2] = H_d - yp[ptype == 2]
 
 h_init = h_w.copy()
 
@@ -499,10 +491,8 @@ SRC_X0, SRC_X1 = 4.5, 5.5
 SRC_Y0, SRC_Y1 = 8.5, 9.5
 SN_SOURCE       = 0.80       # fixed NAPL saturation at source
 
-is_source = np.zeros(N_part, dtype=bool)
-for i in range(N_part):
-    if SRC_X0 <= xp[i] <= SRC_X1 and SRC_Y0 <= yp[i] <= SRC_Y1:
-        is_source[i] = True
+is_source = ((xp >= SRC_X0) & (xp <= SRC_X1) &
+             (yp >= SRC_Y0) & (yp <= SRC_Y1))
 
 n_src = np.sum(is_source)
 print(f"NAPL source particles: {n_src}  "
@@ -513,46 +503,62 @@ S_n = np.zeros(N_part)
 S_n[is_source] = SN_SOURCE
 
 # ======================================================================
-# 8.  IMPERMEABLE BOUNDARY ENFORCEMENT   [Paper Eq. 73-74]
+# 8.  BOUNDARY ENFORCEMENT  (vectorised with precomputed index arrays)
 # ======================================================================
 #
-# For top/bottom impermeable boundaries the paper (Eq. 74) prescribes that
-# boundary-particle hydraulic properties mirror their nearest interior
-# neighbour so that  dH/dn = 0.
-#
-#   H_boundary  =  H_interior_neighbour
-#   =>  h_boundary  =  h_interior + (z_interior - z_boundary)
+# Instead of looping over all N_part particles checking ptype each step,
+# we precompute the index arrays ONCE and use NumPy fancy indexing.
+# This turns O(N_part) Python iterations into O(N_boundary) C-level ops.
+
+# Precompute boundary particle indices
+_idx_left  = np.where(ptype == 1)[0]
+_idx_right = np.where(ptype == 2)[0]
+_idx_bot   = np.where(ptype == 3)[0]
+_idx_top   = np.where(ptype == 4)[0]
+_idx_src   = np.where(is_source)[0]
+
+# Precompute interior mirror indices for impermeable BCs (Eq. 73-74)
+#   bottom (y=0) mirrors from row j=1
+#   top    (y=Ly) mirrors from row j=Ny-2
+_mirror_bot = np.array([idx_2d[min(int(round(xp[i] / dx)), Nx - 1), 1]
+                        for i in _idx_bot], dtype=np.int64)
+_mirror_top = np.array([idx_2d[min(int(round(xp[i] / dx)), Nx - 1), Ny - 2]
+                        for i in _idx_top], dtype=np.int64)
+
+# Precompute elevation differences for impermeable mirror
+#   h_bnd = h_int + (z_int - z_bnd)
+_dz_bot = yp[_mirror_bot] - yp[_idx_bot]    # z_int - z_bnd for bottom
+_dz_top = yp[_mirror_top] - yp[_idx_top]    # z_int - z_bnd for top
+
+# Precompute Dirichlet values (constant, never change)
+_h_dirichlet_left  = H_u - yp[_idx_left]
+_h_dirichlet_right = H_d - yp[_idx_right]
+
+print(f"BC indices precomputed:  left={len(_idx_left)}  right={len(_idx_right)}  "
+      f"bot={len(_idx_bot)}  top={len(_idx_top)}  source={len(_idx_src)}")
+
 
 def enforce_impermeable_bc(h_field):
-    """Mirror H from interior to top/bottom boundary rows."""
-    for i in range(N_part):
-        if ptype[i] == 3:      # bottom  y = 0
-            ix = int(round(xp[i] / dx))
-            ix = min(ix, Nx - 1)
-            j_int = idx_2d[ix, 1]
-            # H_bnd = H_int  =>  h_bnd = h_int + z_int - z_bnd
-            h_field[i] = h_field[j_int] + yp[j_int] - yp[i]
-        elif ptype[i] == 4:    # top  y = Ly
-            ix = int(round(xp[i] / dx))
-            ix = min(ix, Nx - 1)
-            j_int = idx_2d[ix, Ny - 2]
-            h_field[i] = h_field[j_int] + yp[j_int] - yp[i]
+    """Mirror H from interior to top/bottom boundary rows (vectorised)."""
+    h_field[_idx_bot] = h_field[_mirror_bot] + _dz_bot
+    h_field[_idx_top] = h_field[_mirror_top] + _dz_top
+    return h_field
+
+
+def enforce_dirichlet_bc(h_field):
+    """Impose Dirichlet h on left/right boundaries (vectorised)."""
+    h_field[_idx_left]  = _h_dirichlet_left
+    h_field[_idx_right] = _h_dirichlet_right
     return h_field
 
 
 def enforce_napl_bc(Sn):
-    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable walls,
-    maintain source."""
-    for i in range(N_part):
-        if ptype[i] == 1 or ptype[i] == 2:     # left/right: clean water
-            Sn[i] = 0.0
-        elif ptype[i] == 3:                     # bottom: mirror
-            ix = min(int(round(xp[i] / dx)), Nx - 1)
-            Sn[i] = Sn[idx_2d[ix, 1]]
-        elif ptype[i] == 4:                     # top: mirror
-            ix = min(int(round(xp[i] / dx)), Nx - 1)
-            Sn[i] = Sn[idx_2d[ix, Ny - 2]]
-    Sn[is_source] = SN_SOURCE
+    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable, source (vectorised)."""
+    Sn[_idx_left]  = 0.0
+    Sn[_idx_right] = 0.0
+    Sn[_idx_bot]   = Sn[_mirror_bot]
+    Sn[_idx_top]   = Sn[_mirror_top]
+    Sn[_idx_src]   = SN_SOURCE
     return Sn
 
 
@@ -950,10 +956,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 50000          # adjust as needed
-snapshot_every = 1000
-print_every    = 1000
-ckpt_every     = 10*snapshot_every
+N_steps_max    = 2000          # adjust as needed
+snapshot_every = 200
+print_every    = 100
+ckpt_every     = 500
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
@@ -1056,11 +1062,9 @@ for step in range(start_step, N_steps_max + 1):
 
     S_n = np.clip(S_n, 0.0, 1.0 - S_res)
 
-    for i in range(N_part):
-        if ptype[i] == 1:  h_w[i] = H_u - yp[i]
-        if ptype[i] == 2:  h_w[i] = H_d - yp[i]
-    h_w = enforce_impermeable_bc(h_w)
-    S_n = enforce_napl_bc(S_n)
+    enforce_dirichlet_bc(h_w)
+    enforce_impermeable_bc(h_w)
+    enforce_napl_bc(S_n)
 
     t_phys += dt
 

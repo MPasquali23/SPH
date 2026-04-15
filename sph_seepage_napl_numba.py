@@ -117,12 +117,23 @@ print(f"alpha_aw = {g_a:.4f}  alpha_nw = {alpha_nw:.4f}  1/m")
 # ======================================================================
 # 2.  DOMAIN  &  SPH DISCRETISATION
 # ======================================================================
-Lx, Ly = 10.0, 10.0
-
-Nx = 51       # particles in x
-Ny = 51       # particles in y
-dx = Lx / (Nx - 1)
-dy = Ly / (Ny - 1)
+# debugging using different grid sizes
+import sys
+if "--lx" in sys.argv:
+    idx = sys.argv.index("--lx")
+    Lx = Ly = float(sys.argv[idx + 1])
+if "--nx" in sys.argv:
+    idx = sys.argv.index("--nx")
+    Nx = Ny = int(sys.argv[idx + 1])
+    dx = Lx / (Nx - 1)
+    dy = Ly / (Ny - 1)
+else:
+    Lx = 10.0
+    Ly = 10.0
+    Nx = 51       # particles in x
+    Ny = 51       # particles in y
+    dx = Lx / (Nx - 1)
+    dy = Ly / (Ny - 1)
 
 print(f"\nDomain  {Lx} x {Ly} m    grid  {Nx} x {Ny}    "
       f"dx = {dx:.4f} m    dy = {dy:.4f} m")
@@ -949,10 +960,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 5000000          # adjust as needed
-snapshot_every = 1000
-print_every    = 500
-ckpt_every     = 10*snapshot_every
+N_steps_max    = 5000          # adjust as needed
+snapshot_every = 10
+print_every    = 10
+ckpt_every     = 10000
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
