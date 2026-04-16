@@ -258,11 +258,146 @@ def compute_kw_3ph(h_w, S_n):
 def compute_kn_field(h_w, S_n):
     return k_sat_n * compute_krn(h_w, S_n)
 
-def compute_Hn_field(h_w, S_n):
+def compute_Hn_field_np(h_w, S_n):
     Sew=compute_Sew(h_w,S_n)
     base=np.clip(Sew**(-1/m_vG)-1,0,1e12)
     h_cnw=(1/alpha_nw)*base**(1/n_vG)
     return (gamma_w/gamma_n)*(h_w+h_cnw)+yp
+
+# ----------------------------------------------------------------------
+# NUMBA-JITTED CONSTITUTIVE KERNELS
+# ----------------------------------------------------------------------
+# Element-wise per-particle loops parallelised with prange.  Module-level
+# constants are captured as compile-time constants.
+if HAS_NUMBA:
+    @njit(cache=True, parallel=True, fastmath=True)
+    def _compute_Cs_nb(h):
+        N = h.shape[0]
+        out = np.zeros(N)
+        for i in prange(N):
+            hi = h[i]
+            if hi < 0.0:
+                ah  = -hi
+                gah = g_a * ah
+                ahn = gah ** n_vG
+                out[i] = phi_0 * ((S_sat - S_res) * m_vG * n_vG * g_a
+                                   * gah ** (n_vG - 1.0)
+                                   / (1.0 + ahn) ** (m_vG + 1.0))
+        return out
+
+    @njit(cache=True, parallel=True, fastmath=True)
+    def _compute_kw_3ph_nb(h_w, S_n):
+        N = h_w.shape[0]
+        out = np.empty(N)
+        one_minus_wir = 1.0 - S_wir
+        for i in prange(N):
+            hi  = h_w[i]; sni = S_n[i]
+            if hi >= 0.0:
+                Sw_vg = S_sat
+            else:
+                Sw_vg = S_wir + one_minus_wir \
+                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
+            cap = 1.0 - sni
+            Sw  = Sw_vg if Sw_vg < cap else cap
+            if Sw < S_wir: Sw = S_wir
+            if Sw > S_sat: Sw = S_sat
+            Sew = (Sw - S_wir) / one_minus_wir
+            if Sew < 1e-14:       Sew = 1e-14
+            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
+            inner = 1.0 - Sew ** (1.0 / m_vG)
+            if inner < 0.0: inner = 0.0
+            if inner > 1.0: inner = 1.0
+            kr = Sew ** g_l * (1.0 - inner ** m_vG) ** 2
+            if kr < 0.0: kr = 0.0
+            if kr > 1.0: kr = 1.0
+            kv = k_sat * kr
+            if hi >= 0.0 and sni < 1e-12:
+                kv = k_sat
+            out[i] = kv
+        return out
+
+    @njit(cache=True, parallel=True, fastmath=True)
+    def _compute_kn_nb(h_w, S_n):
+        N = h_w.shape[0]
+        out = np.empty(N)
+        one_minus_wir = 1.0 - S_wir
+        for i in prange(N):
+            hi  = h_w[i]; sni = S_n[i]
+            if hi >= 0.0:
+                Sw_vg = S_sat
+            else:
+                Sw_vg = S_wir + one_minus_wir \
+                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
+            cap = 1.0 - sni
+            Sw  = Sw_vg if Sw_vg < cap else cap
+            if Sw < S_wir: Sw = S_wir
+            if Sw > S_sat: Sw = S_sat
+            Sew = (Sw - S_wir) / one_minus_wir
+            if Sew < 1e-14:       Sew = 1e-14
+            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
+            Set_v = (Sw + sni - S_wir) / one_minus_wir
+            if Set_v < 1e-14:       Set_v = 1e-14
+            if Set_v > 1.0 - 1e-10: Set_v = 1.0 - 1e-10
+            Se_n = Set_v - Sew
+            if Se_n < 1e-14: Se_n = 1e-14
+            tw_a = 1.0 - Sew ** (1.0 / m_vG)
+            if tw_a < 0.0: tw_a = 0.0
+            if tw_a > 1.0: tw_a = 1.0
+            tt_a = 1.0 - Set_v ** (1.0 / m_vG)
+            if tt_a < 0.0: tt_a = 0.0
+            if tt_a > 1.0: tt_a = 1.0
+            diff = tw_a ** m_vG - tt_a ** m_vG
+            if diff < 0.0: diff = 0.0
+            kr = Se_n ** g_l * diff ** 2
+            if kr < 0.0: kr = 0.0
+            if kr > 1.0: kr = 1.0
+            out[i] = k_sat_n * kr
+        return out
+
+    @njit(cache=True, parallel=True, fastmath=True)
+    def _compute_Hn_nb(h_w, S_n, yp_arr):
+        N = h_w.shape[0]
+        out = np.empty(N)
+        one_minus_wir = 1.0 - S_wir
+        ratio     = gamma_w / gamma_n
+        inv_alpha = 1.0 / alpha_nw
+        for i in prange(N):
+            hi  = h_w[i]; sni = S_n[i]
+            if hi >= 0.0:
+                Sw_vg = S_sat
+            else:
+                Sw_vg = S_wir + one_minus_wir \
+                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
+            cap = 1.0 - sni
+            Sw  = Sw_vg if Sw_vg < cap else cap
+            if Sw < S_wir: Sw = S_wir
+            if Sw > S_sat: Sw = S_sat
+            Sew = (Sw - S_wir) / one_minus_wir
+            if Sew < 1e-14:       Sew = 1e-14
+            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
+            base = Sew ** (-1.0 / m_vG) - 1.0
+            if base < 0.0:  base = 0.0
+            if base > 1e12: base = 1e12
+            h_cnw = inv_alpha * base ** (1.0 / n_vG)
+            out[i] = ratio * (hi + h_cnw) + yp_arr[i]
+        return out
+
+    # --- Dispatching wrappers: shadow NumPy versions ---
+    def compute_Cs(h):
+        return _compute_Cs_nb(h)
+
+    def compute_kw_3ph(h_w, S_n):
+        return _compute_kw_3ph_nb(h_w, S_n)
+
+    def compute_kn_field(h_w, S_n):
+        return _compute_kn_nb(h_w, S_n)
+
+    def compute_Hn_field(h_w, S_n):
+        return _compute_Hn_nb(h_w, S_n, yp)
+
+else:
+    def compute_Hn_field(h_w, S_n):
+        return compute_Hn_field_np(h_w, S_n)
 
 # ======================================================================
 # PARTICLE CLASSIFICATION + INITIAL CONDITIONS
