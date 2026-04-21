@@ -399,6 +399,60 @@ if HAS_NUMBA:
                 if abs(Kn)>=1e-30:
                     out[i]=(2.0/Kn)*(lap-corr)/C_store[i]
         return out
+
+    # ── FULLY FUSED KERNELS ─────────────────────────────────────────
+    @njit(cache=True, parallel=True)
+    def _sph_dhdt_fused(h_w, S_n, yp_arr, skip_mask,
+                        nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                        L_inv, K_norm, err_x, err_y, Vp_val, N):
+        out = np.zeros(N)
+        for i in prange(N):
+            if not skip_mask[i]:
+                hw_i=h_w[i]; sn_i=S_n[i]
+                Hi=hw_i+yp_arr[i]; ki=_s_kw(hw_i,sn_i)
+                raw_gx=0.0; raw_gy=0.0
+                for k in range(nbr_ptr[i],nbr_ptr[i+1]):
+                    j=nbr_j[k]; Hj=h_w[j]+yp_arr[j]; dH=Hj-Hi
+                    raw_gx+=Vp_val*dH*nbr_gWx[k]; raw_gy+=Vp_val*dH*nbr_gWy[k]
+                L00=L_inv[i,0,0];L01=L_inv[i,0,1];L10=L_inv[i,1,0];L11=L_inv[i,1,1]
+                gHx=L00*raw_gx+L01*raw_gy; gHy=L10*raw_gx+L11*raw_gy
+                lap=0.0
+                for k in range(nbr_ptr[i],nbr_ptr[i+1]):
+                    j=nbr_j[k]; kj=_s_kw(h_w[j],S_n[j])
+                    Hj=h_w[j]+yp_arr[j]; km=0.5*(ki+kj)
+                    lap+=Vp_val*km*(Hj-Hi)*nbr_Fhat[k]
+                corr=ki*(gHx*err_x[i]+gHy*err_y[i])
+                Kn=K_norm[i]
+                if abs(Kn)>=1e-30:
+                    Ct=_s_Ctilde(hw_i)
+                    out[i]=(2.0/Kn)*(lap-corr)/Ct
+        return out
+
+    @njit(cache=True, parallel=True)
+    def _sph_dSndt_fused(h_w, S_n, yp_arr, skip_mask,
+                         nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                         L_inv, K_norm, err_x, err_y, Vp_val, N, phi_val):
+        out = np.zeros(N)
+        for i in prange(N):
+            if not skip_mask[i]:
+                hw_i=h_w[i]; sn_i=S_n[i]
+                Hi=_s_Hn(hw_i,sn_i,yp_arr[i]); ki=_s_kn(hw_i,sn_i)
+                raw_gx=0.0; raw_gy=0.0
+                for k in range(nbr_ptr[i],nbr_ptr[i+1]):
+                    j=nbr_j[k]; Hj=_s_Hn(h_w[j],S_n[j],yp_arr[j]); dH=Hj-Hi
+                    raw_gx+=Vp_val*dH*nbr_gWx[k]; raw_gy+=Vp_val*dH*nbr_gWy[k]
+                L00=L_inv[i,0,0];L01=L_inv[i,0,1];L10=L_inv[i,1,0];L11=L_inv[i,1,1]
+                gHx=L00*raw_gx+L01*raw_gy; gHy=L10*raw_gx+L11*raw_gy
+                lap=0.0
+                for k in range(nbr_ptr[i],nbr_ptr[i+1]):
+                    j=nbr_j[k]; kj=_s_kn(h_w[j],S_n[j])
+                    Hj=_s_Hn(h_w[j],S_n[j],yp_arr[j]); km=0.5*(ki+kj)
+                    lap+=Vp_val*km*(Hj-Hi)*nbr_Fhat[k]
+                corr=ki*(gHx*err_x[i]+gHy*err_y[i])
+                Kn=K_norm[i]
+                if abs(Kn)>=1e-30:
+                    out[i]=(2.0/Kn)*(lap-corr)/phi_val
+        return out
 else:
     def _sph_div_k_gradH(H_f, k_h, C_store, skip_mask,
                           nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
@@ -438,15 +492,25 @@ def _precompute_step(hw, Sn):
         _fld_kn[:]=compute_kn_field(hw,Sn); _fld_Hn[:]=compute_Hn_field(hw,Sn)
 
 def compute_dhdt(hw, Sn):
-    _precompute_step(hw, Sn)
-    return _sph_div_k_gradH(_fld_Hw,_fld_kw,_fld_Ct,_skip_dirichlet,
-                             nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
-                             L_inv,K_norm,err_x,err_y,Vp,N_part)
+    if HAS_NUMBA:
+        return _sph_dhdt_fused(hw, Sn, yp, _skip_dirichlet,
+                                nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                L_inv,K_norm,err_x,err_y,Vp,N_part)
+    else:
+        _precompute_step(hw, Sn)
+        return _sph_div_k_gradH(_fld_Hw,_fld_kw,_fld_Ct,_skip_dirichlet,
+                                 nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                 L_inv,K_norm,err_x,err_y,Vp,N_part)
 
 def compute_dSndt(hw, Sn):
-    return _sph_div_k_gradH(_fld_Hn,_fld_kn,_fld_Cn,_skip_napl,
-                             nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
-                             L_inv,K_norm,err_x,err_y,Vp,N_part)
+    if HAS_NUMBA:
+        return _sph_dSndt_fused(hw, Sn, yp, _skip_napl,
+                                 nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                 L_inv,K_norm,err_x,err_y,Vp,N_part,phi_0)
+    else:
+        return _sph_div_k_gradH(_fld_Hn,_fld_kn,_fld_Cn,_skip_napl,
+                                 nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                 L_inv,K_norm,err_x,err_y,Vp,N_part)
 
 def stable_dt(hw, Sn):
     Cs=compute_Cs(hw); Ct=C_l+Cs; C_min=max(np.min(Ct),C_l)
@@ -512,22 +576,39 @@ t_loop0 = wall_time.perf_counter()
 for step in range(1, N_steps + 1):
     dt = stable_dt(h_w, S_n)
 
-    # -- Constitutive (fused Numba prange or NumPy fallback) --
-    tc0 = wall_time.perf_counter()
-    _precompute_step(h_w, S_n)
-    tc1 = wall_time.perf_counter()
-    t_constitutive += tc1 - tc0
+    if HAS_NUMBA:
+        # Fused path: constitutive + SPH in one call
+        # (Measure both together — they're now fused)
+        tc0 = wall_time.perf_counter()
+        # No separate precompute — constitutive is inlined
+        tc1 = wall_time.perf_counter()
+        t_constitutive += tc1 - tc0
 
-    # -- SPH kernels --
-    tk0 = wall_time.perf_counter()
-    dhdt  = _sph_div_k_gradH(_fld_Hw, _fld_kw, _fld_Ct, _skip_dirichlet,
-                               nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
-                               L_inv,K_norm,err_x,err_y, Vp, N_part)
-    dSndt = _sph_div_k_gradH(_fld_Hn, _fld_kn, _fld_Cn, _skip_napl,
-                               nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
-                               L_inv,K_norm,err_x,err_y, Vp, N_part)
-    tk1 = wall_time.perf_counter()
-    t_sph_kernel += tk1 - tk0
+        tk0 = wall_time.perf_counter()
+        dhdt  = _sph_dhdt_fused(h_w, S_n, yp, _skip_dirichlet,
+                                 nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                 L_inv,K_norm,err_x,err_y, Vp, N_part)
+        dSndt = _sph_dSndt_fused(h_w, S_n, yp, _skip_napl,
+                                  nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                  L_inv,K_norm,err_x,err_y, Vp, N_part, phi_0)
+        tk1 = wall_time.perf_counter()
+        t_sph_kernel += tk1 - tk0
+    else:
+        # Fallback: separate precompute then SPH
+        tc0 = wall_time.perf_counter()
+        _precompute_step(h_w, S_n)
+        tc1 = wall_time.perf_counter()
+        t_constitutive += tc1 - tc0
+
+        tk0 = wall_time.perf_counter()
+        dhdt  = _sph_div_k_gradH(_fld_Hw, _fld_kw, _fld_Ct, _skip_dirichlet,
+                                   nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                   L_inv,K_norm,err_x,err_y, Vp, N_part)
+        dSndt = _sph_div_k_gradH(_fld_Hn, _fld_kn, _fld_Cn, _skip_napl,
+                                   nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
+                                   L_inv,K_norm,err_x,err_y, Vp, N_part)
+        tk1 = wall_time.perf_counter()
+        t_sph_kernel += tk1 - tk0
 
     # -- Update + BCs --
     tu0 = wall_time.perf_counter()

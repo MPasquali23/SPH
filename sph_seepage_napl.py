@@ -39,13 +39,20 @@ import numpy as np
 import os
 import sys
 import time as wall_time
-from scipy.spatial import cKDTree
 
+try:
+    import numba
+    from numba import njit
+    HAS_NUMBA = True
+    print("Numba available — JIT-accelerated particle loops enabled.")
+except ImportError:
+    HAS_NUMBA = False
+    print("WARNING: Numba not available — falling back to pure Python loops.")
 
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph"
+OUTPUT_DIR = "../data_sph/omp/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -173,6 +180,8 @@ support_r = 2.0 * h_sml
 
 print("Building neighbour lists (cKDTree) ...", flush=True)
 
+from scipy.spatial import cKDTree
+
 tree = cKDTree(np.column_stack([xp, yp]))
 nbl  = tree.query_ball_tree(tree, r=support_r)      # list of lists
 
@@ -199,7 +208,27 @@ for i in range(N_part):
 
         neighbours[i].append((j, r, xji, yji, Fhat, gWx, gWy))
 
-print("  done.")
+print("  done.  Converting to CSR arrays ...", flush=True)
+
+# --- Convert neighbour lists to CSR arrays for Numba ---
+_total_nbrs = sum(len(nb) for nb in neighbours)
+nbr_j    = np.empty(_total_nbrs, dtype=np.int64)
+nbr_Fhat = np.empty(_total_nbrs, dtype=np.float64)
+nbr_gWx  = np.empty(_total_nbrs, dtype=np.float64)
+nbr_gWy  = np.empty(_total_nbrs, dtype=np.float64)
+nbr_ptr  = np.empty(N_part + 1, dtype=np.int64)
+
+_offset = 0
+for i in range(N_part):
+    nbr_ptr[i] = _offset
+    for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
+        nbr_j[_offset]    = j
+        nbr_Fhat[_offset] = Fhat
+        nbr_gWx[_offset]  = gWx
+        nbr_gWy[_offset]  = gWy
+        _offset += 1
+nbr_ptr[N_part] = _offset
+print(f"  CSR: {_total_nbrs} entries, avg {_total_nbrs/N_part:.1f} per particle")
 
 # ======================================================================
 # 5.  PRECOMPUTE SPH CORRECTION QUANTITIES
@@ -244,7 +273,8 @@ for i in range(N_part):
     else:
         L_inv[i] = np.eye(2)
 
-print("  done.")
+print("  done.  (neighbour list freed — using CSR arrays from now on)")
+del neighbours
 
 # ======================================================================
 # 6.  VAN GENUCHTEN  SWRC + MUALEM   [Paper Eqs. 31-32]
@@ -319,6 +349,131 @@ def compute_Cs(h):
 # The wetting order is  water > NAPL > air  (water most wetting).
 
 S_wir = S_res   # irreducible (residual) water saturation
+
+# Precompute ratio (used in H_n calculation)
+_gamma_ratio = gamma_w / gamma_n
+_inv_alpha_nw = 1.0 / alpha_nw
+_inv_m = 1.0 / m_vG
+_inv_n = 1.0 / n_vG
+
+# ── Scalar Numba constitutive helpers ────────────────────────────────
+#
+# These are called per-particle inside prange loops.  They access
+# module-level scalar constants (k_sat, m_vG, etc.) which Numba
+# captures at compile time.  inline='always' eliminates call overhead.
+
+if HAS_NUMBA:
+    @njit(inline='always')
+    def _s_Sw(hw, sn):
+        """Scalar water saturation."""
+        if hw >= 0.0:
+            sw = S_sat
+        else:
+            sw = S_wir + (1.0 - S_wir) * (1.0 + (g_a * abs(hw))**n_vG)**(-m_vG)
+        cap = 1.0 - sn
+        if sw > cap:
+            sw = cap
+        if sw < S_wir:
+            sw = S_wir
+        if sw > S_sat:
+            sw = S_sat
+        return sw
+
+    @njit(inline='always')
+    def _s_Sew(sw):
+        """Scalar effective water saturation."""
+        v = (sw - S_wir) / (1.0 - S_wir)
+        if v < 1e-14:  v = 1e-14
+        if v > 1.0 - 1e-10:  v = 1.0 - 1e-10
+        return v
+
+    @njit(inline='always')
+    def _s_Set(sw, sn):
+        """Scalar effective total-liquid saturation."""
+        v = (sw + sn - S_wir) / (1.0 - S_wir)
+        if v < 1e-14:  v = 1e-14
+        if v > 1.0 - 1e-10:  v = 1.0 - 1e-10
+        return v
+
+    @njit(inline='always')
+    def _s_kw(hw, sn):
+        """Scalar water hydraulic conductivity."""
+        if hw >= 0.0 and sn < 1e-12:
+            return k_sat
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        inner = 1.0 - sew**_inv_m
+        if inner < 0.0: inner = 0.0
+        if inner > 1.0: inner = 1.0
+        kr = sew**g_l * (1.0 - inner**m_vG)**2
+        if kr < 0.0: kr = 0.0
+        if kr > 1.0: kr = 1.0
+        return k_sat * kr
+
+    @njit(inline='always')
+    def _s_kn(hw, sn):
+        """Scalar NAPL hydraulic conductivity."""
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        st  = _s_Set(sw, sn)
+        se_n = st - sew
+        if se_n < 1e-14: se_n = 1e-14
+        tw = (1.0 - sew**_inv_m)**m_vG
+        if tw < 0.0: tw = 0.0
+        if tw > 1.0: tw = 1.0
+        tt = (1.0 - st**_inv_m)**m_vG
+        if tt < 0.0: tt = 0.0
+        if tt > 1.0: tt = 1.0
+        diff = tw - tt
+        if diff < 0.0: diff = 0.0
+        kr = se_n**g_l * diff**2
+        if kr < 0.0: kr = 0.0
+        if kr > 1.0: kr = 1.0
+        return k_sat_n * kr
+
+    @njit(inline='always')
+    def _s_Hn(hw, sn, yp_i):
+        """Scalar NAPL hydraulic head."""
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        base = sew**(-_inv_m) - 1.0
+        if base < 0.0: base = 0.0
+        if base > 1e12: base = 1e12
+        h_cnw = _inv_alpha_nw * base**_inv_n
+        return _gamma_ratio * (hw + h_cnw) + yp_i
+
+    @njit(inline='always')
+    def _s_Ctilde(hw):
+        """Scalar total storage coefficient C_tilde = max(C_l + Cs, C_l)."""
+        if hw >= 0.0:
+            return C_l
+        ah = abs(hw)
+        ahn = (g_a * ah)**n_vG
+        dSr = ((S_sat - S_res) * m_vG * n_vG * g_a
+               * (g_a * ah)**(n_vG - 1.0)
+               / (1.0 + ahn)**(m_vG + 1.0))
+        Cs = phi_0 * dSr
+        ct = C_l + Cs
+        if ct < C_l:
+            ct = C_l
+        return ct
+
+    # ── Fused precompute: all 5 constitutive fields in one prange ────
+    @njit(cache=True, parallel=True)
+    def _precompute_fields(h_w, S_n, yp_arr, N,
+                           kw_out, Hw_out, Ct_out, kn_out, Hn_out):
+        """Compute kw, Hw, C_tilde, kn, Hn for all particles in parallel."""
+        for i in prange(N):
+            hw_i = h_w[i]
+            sn_i = S_n[i]
+            kw_out[i] = _s_kw(hw_i, sn_i)
+            Hw_out[i] = hw_i + yp_arr[i]
+            Ct_out[i] = _s_Ctilde(hw_i)
+            kn_out[i] = _s_kn(hw_i, sn_i)
+            Hn_out[i] = _s_Hn(hw_i, sn_i, yp_arr[i])
+
+
+# ── NumPy vectorised constitutive functions (kept for fallback + plots) ─
 
 
 def compute_Sw_3ph(h_w, S_n):
@@ -445,15 +600,11 @@ print(f"\nParticle types:  interior={n_int}  left={n_left}  "
 # adjustment, then *plateau* at a small numerical residual once the true
 # steady state is reached - that plateau is the signal of convergence.
 
-h_w = np.zeros(N_part)
-for i in range(N_part):
-    H_guess = H_u + (H_d - H_u) * xp[i] / Lx
-    h_w[i]  = H_guess - yp[i]
+h_w = H_u + (H_d - H_u) * xp / Lx - yp      # vectorised
 
-# Enforce Dirichlet BCs on left/right
-for i in range(N_part):
-    if ptype[i] == 1:  h_w[i] = H_u - yp[i]
-    if ptype[i] == 2:  h_w[i] = H_d - yp[i]
+# Enforce Dirichlet BCs on left/right (vectorised)
+h_w[ptype == 1] = H_u - yp[ptype == 1]
+h_w[ptype == 2] = H_d - yp[ptype == 2]
 
 h_init = h_w.copy()
 
@@ -465,10 +616,8 @@ SRC_X0, SRC_X1 = 4.5, 5.5
 SRC_Y0, SRC_Y1 = 8.5, 9.5
 SN_SOURCE       = 0.80       # fixed NAPL saturation at source
 
-is_source = np.zeros(N_part, dtype=bool)
-for i in range(N_part):
-    if SRC_X0 <= xp[i] <= SRC_X1 and SRC_Y0 <= yp[i] <= SRC_Y1:
-        is_source[i] = True
+is_source = ((xp >= SRC_X0) & (xp <= SRC_X1) &
+             (yp >= SRC_Y0) & (yp <= SRC_Y1))
 
 n_src = np.sum(is_source)
 print(f"NAPL source particles: {n_src}  "
@@ -479,212 +628,377 @@ S_n = np.zeros(N_part)
 S_n[is_source] = SN_SOURCE
 
 # ======================================================================
-# 8.  IMPERMEABLE BOUNDARY ENFORCEMENT   [Paper Eq. 73-74]
+# 8.  BOUNDARY ENFORCEMENT  (vectorised with precomputed index arrays)
 # ======================================================================
 #
-# For top/bottom impermeable boundaries the paper (Eq. 74) prescribes that
-# boundary-particle hydraulic properties mirror their nearest interior
-# neighbour so that  dH/dn = 0.
-#
-#   H_boundary  =  H_interior_neighbour
-#   =>  h_boundary  =  h_interior + (z_interior - z_boundary)
+# Instead of looping over all N_part particles checking ptype each step,
+# we precompute the index arrays ONCE and use NumPy fancy indexing.
+# This turns O(N_part) Python iterations into O(N_boundary) C-level ops.
+
+# Precompute boundary particle indices
+_idx_left  = np.where(ptype == 1)[0]
+_idx_right = np.where(ptype == 2)[0]
+_idx_bot   = np.where(ptype == 3)[0]
+_idx_top   = np.where(ptype == 4)[0]
+_idx_src   = np.where(is_source)[0]
+
+# Precompute interior mirror indices for impermeable BCs (Eq. 73-74)
+#   bottom (y=0) mirrors from row j=1
+#   top    (y=Ly) mirrors from row j=Ny-2
+_mirror_bot = np.array([idx_2d[min(int(round(xp[i] / dx)), Nx - 1), 1]
+                        for i in _idx_bot], dtype=np.int64)
+_mirror_top = np.array([idx_2d[min(int(round(xp[i] / dx)), Nx - 1), Ny - 2]
+                        for i in _idx_top], dtype=np.int64)
+
+# Precompute elevation differences for impermeable mirror
+#   h_bnd = h_int + (z_int - z_bnd)
+_dz_bot = yp[_mirror_bot] - yp[_idx_bot]    # z_int - z_bnd for bottom
+_dz_top = yp[_mirror_top] - yp[_idx_top]    # z_int - z_bnd for top
+
+# Precompute Dirichlet values (constant, never change)
+_h_dirichlet_left  = H_u - yp[_idx_left]
+_h_dirichlet_right = H_d - yp[_idx_right]
+
+print(f"BC indices precomputed:  left={len(_idx_left)}  right={len(_idx_right)}  "
+      f"bot={len(_idx_bot)}  top={len(_idx_top)}  source={len(_idx_src)}")
+
 
 def enforce_impermeable_bc(h_field):
-    """Mirror H from interior to top/bottom boundary rows."""
-    for i in range(N_part):
-        if ptype[i] == 3:      # bottom  y = 0
-            ix = int(round(xp[i] / dx))
-            ix = min(ix, Nx - 1)
-            j_int = idx_2d[ix, 1]
-            # H_bnd = H_int  =>  h_bnd = h_int + z_int - z_bnd
-            h_field[i] = h_field[j_int] + yp[j_int] - yp[i]
-        elif ptype[i] == 4:    # top  y = Ly
-            ix = int(round(xp[i] / dx))
-            ix = min(ix, Nx - 1)
-            j_int = idx_2d[ix, Ny - 2]
-            h_field[i] = h_field[j_int] + yp[j_int] - yp[i]
+    """Mirror H from interior to top/bottom boundary rows (vectorised)."""
+    h_field[_idx_bot] = h_field[_mirror_bot] + _dz_bot
+    h_field[_idx_top] = h_field[_mirror_top] + _dz_top
+    return h_field
+
+
+def enforce_dirichlet_bc(h_field):
+    """Impose Dirichlet h on left/right boundaries (vectorised)."""
+    h_field[_idx_left]  = _h_dirichlet_left
+    h_field[_idx_right] = _h_dirichlet_right
     return h_field
 
 
 def enforce_napl_bc(Sn):
-    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable walls,
-    maintain source."""
-    for i in range(N_part):
-        if ptype[i] == 1 or ptype[i] == 2:     # left/right: clean water
-            Sn[i] = 0.0
-        elif ptype[i] == 3:                     # bottom: mirror
-            ix = min(int(round(xp[i] / dx)), Nx - 1)
-            Sn[i] = Sn[idx_2d[ix, 1]]
-        elif ptype[i] == 4:                     # top: mirror
-            ix = min(int(round(xp[i] / dx)), Nx - 1)
-            Sn[i] = Sn[idx_2d[ix, Ny - 2]]
-    Sn[is_source] = SN_SOURCE
+    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable, source (vectorised)."""
+    Sn[_idx_left]  = 0.0
+    Sn[_idx_right] = 0.0
+    Sn[_idx_bot]   = Sn[_mirror_bot]
+    Sn[_idx_top]   = Sn[_mirror_top]
+    Sn[_idx_src]   = SN_SOURCE
     return Sn
 
 
 # ======================================================================
-# 9.  RHS:  dh/dt  =  (1/C_tilde) div[ k grad(H) ]    [Paper Eq. 57]
+# 9.  NUMBA-JITTED SPH OPERATORS  +  WRAPPER FUNCTIONS
 # ======================================================================
 #
-# SPH form  (Eq. 57, isotropic  k^mn = k delta^mn):
+# The inner particle loops are factored into Numba-compiled functions
+# that operate on CSR neighbour arrays.  The Python wrappers handle
+# the NumPy constitutive evaluations (k, H, Cs), then call the jitted
+# inner loops.
 #
-#   dh_i/dt = (1/C_tilde) * (2/K_norm) *
-#       [ sum_j V_j k_ij_mean (H_j - H_i) F_hat
-#         - k_i * (grad_H_i . err_vec_i) ]
-#
-# where  k_ij_mean = (k_i + k_j)/2   (arithmetic mean)
+# Both compute_dhdt and compute_dSndt use the SAME SPH operator:
+#   div[k grad(H)] via the corrected Laplacian (Eq. 57).
+# They differ only in: k-field, H-field, skip mask, storage divisor.
+
+if HAS_NUMBA:
+    from numba import prange
+
+    @njit(cache=True, parallel=True)
+    def _sph_div_k_gradH(H_f, k_h, C_store, ptype_arr, skip_mask,
+                          nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                          L_inv, K_norm, err_x, err_y, Vp_val, N):
+        """Corrected Laplacian with precomputed field arrays.
+        Used by Darcy velocity (snapshot path) and NumPy fallback.
+        """
+        out = np.zeros(N)
+        for i in prange(N):
+            if not skip_mask[i]:
+                Hi = H_f[i]
+                ki = k_h[i]
+
+                raw_gx = 0.0
+                raw_gy = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    dH = H_f[j] - Hi
+                    raw_gx += Vp_val * dH * nbr_gWx[k]
+                    raw_gy += Vp_val * dH * nbr_gWy[k]
+
+                L00 = L_inv[i, 0, 0]; L01 = L_inv[i, 0, 1]
+                L10 = L_inv[i, 1, 0]; L11 = L_inv[i, 1, 1]
+                grad_Hx = L00 * raw_gx + L01 * raw_gy
+                grad_Hy = L10 * raw_gx + L11 * raw_gy
+
+                lap_sum = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    km = 0.5 * (ki + k_h[j])
+                    lap_sum += Vp_val * km * (H_f[j] - Hi) * nbr_Fhat[k]
+
+                corr = ki * (grad_Hx * err_x[i] + grad_Hy * err_y[i])
+
+                Kn = K_norm[i]
+                if abs(Kn) >= 1e-30:
+                    out[i] = (2.0 / Kn) * (lap_sum - corr) / C_store[i]
+
+        return out
+
+    # ── FULLY FUSED KERNELS: no intermediate field arrays ──────────────
+    #
+    # These compute k and H on-the-fly from h_w and S_n directly.
+    # Each neighbour access evaluates the scalar constitutive helpers
+    # instead of reading precomputed arrays — trading ~25 FLOPs per
+    # neighbour for 2 memory reads per neighbour.  On a memory-bound
+    # code this is a major win.
+
+    @njit(cache=True, parallel=True)
+    def _sph_dhdt_fused(h_w, S_n, yp_arr, skip_mask,
+                        nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                        L_inv, K_norm, err_x, err_y, Vp_val, N):
+        """Water RHS dh_w/dt — fully fused (k_w, H_w, C_tilde computed inline)."""
+        out = np.zeros(N)
+        for i in prange(N):
+            if not skip_mask[i]:
+                hw_i = h_w[i]
+                sn_i = S_n[i]
+                Hi = hw_i + yp_arr[i]             # H_w self
+                ki = _s_kw(hw_i, sn_i)            # k_w self
+
+                # -- corrected gradient of H_w --
+                raw_gx = 0.0
+                raw_gy = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    Hj = h_w[j] + yp_arr[j]
+                    dH = Hj - Hi
+                    raw_gx += Vp_val * dH * nbr_gWx[k]
+                    raw_gy += Vp_val * dH * nbr_gWy[k]
+
+                L00 = L_inv[i, 0, 0]; L01 = L_inv[i, 0, 1]
+                L10 = L_inv[i, 1, 0]; L11 = L_inv[i, 1, 1]
+                grad_Hx = L00 * raw_gx + L01 * raw_gy
+                grad_Hy = L10 * raw_gx + L11 * raw_gy
+
+                # -- variable-k Laplacian sum --
+                lap_sum = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    kj = _s_kw(h_w[j], S_n[j])
+                    Hj = h_w[j] + yp_arr[j]
+                    km = 0.5 * (ki + kj)
+                    lap_sum += Vp_val * km * (Hj - Hi) * nbr_Fhat[k]
+
+                corr = ki * (grad_Hx * err_x[i] + grad_Hy * err_y[i])
+
+                Kn = K_norm[i]
+                if abs(Kn) >= 1e-30:
+                    Ct = _s_Ctilde(hw_i)
+                    out[i] = (2.0 / Kn) * (lap_sum - corr) / Ct
+
+        return out
+
+    @njit(cache=True, parallel=True)
+    def _sph_dSndt_fused(h_w, S_n, yp_arr, skip_mask,
+                         nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                         L_inv, K_norm, err_x, err_y, Vp_val, N, phi_val):
+        """NAPL RHS dS_n/dt — fully fused (k_n, H_n computed inline)."""
+        out = np.zeros(N)
+        for i in prange(N):
+            if not skip_mask[i]:
+                hw_i = h_w[i]
+                sn_i = S_n[i]
+                Hi = _s_Hn(hw_i, sn_i, yp_arr[i])   # H_n self
+                ki = _s_kn(hw_i, sn_i)              # k_n self
+
+                # -- corrected gradient of H_n --
+                raw_gx = 0.0
+                raw_gy = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    Hj = _s_Hn(h_w[j], S_n[j], yp_arr[j])
+                    dH = Hj - Hi
+                    raw_gx += Vp_val * dH * nbr_gWx[k]
+                    raw_gy += Vp_val * dH * nbr_gWy[k]
+
+                L00 = L_inv[i, 0, 0]; L01 = L_inv[i, 0, 1]
+                L10 = L_inv[i, 1, 0]; L11 = L_inv[i, 1, 1]
+                grad_Hx = L00 * raw_gx + L01 * raw_gy
+                grad_Hy = L10 * raw_gx + L11 * raw_gy
+
+                # -- variable-kn Laplacian sum --
+                lap_sum = 0.0
+                for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                    j = nbr_j[k]
+                    kj = _s_kn(h_w[j], S_n[j])
+                    Hj = _s_Hn(h_w[j], S_n[j], yp_arr[j])
+                    km = 0.5 * (ki + kj)
+                    lap_sum += Vp_val * km * (Hj - Hi) * nbr_Fhat[k]
+
+                corr = ki * (grad_Hx * err_x[i] + grad_Hy * err_y[i])
+
+                Kn = K_norm[i]
+                if abs(Kn) >= 1e-30:
+                    out[i] = (2.0 / Kn) * (lap_sum - corr) / phi_val
+
+        return out
+
+    @njit(cache=True, parallel=True)
+    def _sph_kvar_gradient(H_f, k_h,
+                            nbr_ptr, nbr_j, nbr_gWx, nbr_gWy,
+                            L_inv, Vp_val, N):
+        """Corrected gradient with variable-k weighting.
+        Parallelised over particles with numba.prange.
+        """
+        qx = np.zeros(N)
+        qy = np.zeros(N)
+        for i in prange(N):
+            L00 = L_inv[i, 0, 0]; L01 = L_inv[i, 0, 1]
+            L10 = L_inv[i, 1, 0]; L11 = L_inv[i, 1, 1]
+            ki = k_h[i]
+            Hi = H_f[i]
+            sx = 0.0
+            sy = 0.0
+            for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+                j = nbr_j[k]
+                km  = 0.5 * (ki + k_h[j])
+                dH  = H_f[j] - Hi
+                gx  = nbr_gWx[k]
+                gy  = nbr_gWy[k]
+                cWx = L00 * gx + L01 * gy
+                cWy = L10 * gx + L11 * gy
+                val = Vp_val * km * dH
+                sx += val * cWx
+                sy += val * cWy
+            qx[i] = sx
+            qy[i] = sy
+        return qx, qy
+
+# ---------- Fallback pure-Python implementations (same logic) ----------
+
+def _sph_div_k_gradH_py(H_f, k_h, C_store, ptype_arr, skip_mask,
+                          nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                          L_inv, K_norm, err_x, err_y, Vp_val, N):
+    out = np.zeros(N)
+    for i in range(N):
+        if skip_mask[i]:
+            continue
+        Hi = H_f[i]; ki = k_h[i]
+        raw_gx = 0.0; raw_gy = 0.0
+        for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+            j = nbr_j[k]; dH = H_f[j] - Hi
+            raw_gx += Vp_val * dH * nbr_gWx[k]
+            raw_gy += Vp_val * dH * nbr_gWy[k]
+        L00=L_inv[i,0,0]; L01=L_inv[i,0,1]; L10=L_inv[i,1,0]; L11=L_inv[i,1,1]
+        grad_Hx = L00*raw_gx + L01*raw_gy
+        grad_Hy = L10*raw_gx + L11*raw_gy
+        lap_sum = 0.0
+        for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+            j = nbr_j[k]; km = 0.5*(ki+k_h[j])
+            lap_sum += Vp_val * km * (H_f[j]-Hi) * nbr_Fhat[k]
+        corr = ki * (grad_Hx*err_x[i] + grad_Hy*err_y[i])
+        Kn = K_norm[i]
+        if abs(Kn) < 1e-30: continue
+        out[i] = (2.0/Kn)*(lap_sum-corr)/C_store[i]
+    return out
+
+def _sph_kvar_gradient_py(H_f, k_h, nbr_ptr, nbr_j, nbr_gWx, nbr_gWy,
+                           L_inv, Vp_val, N):
+    qx = np.zeros(N); qy = np.zeros(N)
+    for i in range(N):
+        L00=L_inv[i,0,0]; L01=L_inv[i,0,1]; L10=L_inv[i,1,0]; L11=L_inv[i,1,1]
+        ki=k_h[i]; Hi=H_f[i]; sx=0.0; sy=0.0
+        for k in range(nbr_ptr[i], nbr_ptr[i+1]):
+            j=nbr_j[k]; km=0.5*(ki+k_h[j]); dH=H_f[j]-Hi
+            gx=nbr_gWx[k]; gy=nbr_gWy[k]
+            cWx=L00*gx+L01*gy; cWy=L10*gx+L11*gy
+            val=Vp_val*km*dH; sx+=val*cWx; sy+=val*cWy
+        qx[i]=sx; qy[i]=sy
+    return qx, qy
+
+# Choose implementation
+_div_k_gradH  = _sph_div_k_gradH  if HAS_NUMBA else _sph_div_k_gradH_py
+_kvar_gradient = _sph_kvar_gradient if HAS_NUMBA else _sph_kvar_gradient_py
+
+# ---------- Wrapper functions (same API as before) ----------
+
+# Precompute skip masks (boolean arrays)
+_skip_dirichlet = (ptype == 1) | (ptype == 2)
+_skip_napl      = _skip_dirichlet | is_source
+
+# Pre-allocate reusable field arrays (avoids allocation every step)
+_fld_kw = np.empty(N_part)
+_fld_Hw = np.empty(N_part)
+_fld_Ct = np.empty(N_part)
+_fld_kn = np.empty(N_part)
+_fld_Hn = np.empty(N_part)
+_fld_Cn = np.full(N_part, phi_0)    # constant, never changes
+
+
+def _precompute_step(h_field, Sn_field):
+    """Compute all constitutive fields for both phases.
+    Uses Numba prange (parallel) if available, else NumPy (serial).
+    """
+    if HAS_NUMBA:
+        _precompute_fields(h_field, Sn_field, yp, N_part,
+                           _fld_kw, _fld_Hw, _fld_Ct, _fld_kn, _fld_Hn)
+    else:
+        _fld_kw[:] = compute_kw_3ph(h_field, Sn_field)
+        _fld_Hw[:] = h_field + yp
+        Cs = compute_Cs(h_field)
+        np.maximum(C_l + Cs, C_l, out=_fld_Ct)
+        _fld_kn[:] = compute_kn_field(h_field, Sn_field)
+        _fld_Hn[:] = compute_Hn_field(h_field, Sn_field)
+
 
 def compute_dhdt(h_field, Sn_field):
     """RHS of the water seepage equation (three-phase k_w)."""
-    k_h   = compute_kw_3ph(h_field, Sn_field)
-    Cs    = compute_Cs(h_field)
-    H_f   = h_field + yp            # hydraulic head
+    if HAS_NUMBA:
+        # Fused path: compute k_w, H_w, C_tilde on-the-fly inside kernel
+        return _sph_dhdt_fused(h_field, Sn_field, yp, _skip_dirichlet,
+                                nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                                L_inv, K_norm, err_x, err_y, Vp, N_part)
+    else:
+        # Fallback: precompute fields then standard SPH
+        _precompute_step(h_field, Sn_field)
+        return _div_k_gradH(_fld_Hw, _fld_kw, _fld_Ct, ptype, _skip_dirichlet,
+                             nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                             L_inv, K_norm, err_x, err_y, Vp, N_part)
 
-    C_tilde = np.maximum(C_l + Cs, C_l)
-
-    dhdt = np.zeros(N_part)
-
-    for i in range(N_part):
-        # Dirichlet particles - fixed
-        if ptype[i] == 1 or ptype[i] == 2:
-            continue
-
-        Hi = H_f[i]
-        ki = k_h[i]
-
-        # -- corrected gradient of H (for error-correction term) --
-        raw_gx = 0.0; raw_gy = 0.0
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            dH = H_f[j] - Hi
-            raw_gx += Vp * dH * gWx
-            raw_gy += Vp * dH * gWy
-        Li = L_inv[i]
-        grad_Hx = Li[0, 0] * raw_gx + Li[0, 1] * raw_gy
-        grad_Hy = Li[1, 0] * raw_gx + Li[1, 1] * raw_gy
-
-        # -- variable-k Laplacian term (Eq. 57 first sum) --
-        lap_sum = 0.0
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            k_mean = 0.5 * (ki + k_h[j])
-            lap_sum += Vp * k_mean * (H_f[j] - Hi) * Fhat
-
-        # -- error-correction term (Eq. 57 second sum, isotropic) --
-        corr = ki * (grad_Hx * err_x[i] + grad_Hy * err_y[i])
-
-        Kn = K_norm[i]
-        if abs(Kn) < 1e-30:
-            continue
-
-        rhs = (2.0 / Kn) * (lap_sum - corr)
-        dhdt[i] = rhs / C_tilde[i]
-
-    return dhdt
-
-
-# ======================================================================
-# 9b. NAPL RHS:  dS_n/dt  =  (1/phi) div[ k_n grad(H_n) ]
-# ======================================================================
 
 def compute_dSndt(h_field, Sn_field):
-    """NAPL transport equation RHS.  Same SPH Laplacian structure."""
-    k_n = compute_kn_field(h_field, Sn_field)
-    H_n = compute_Hn_field(h_field, Sn_field)
+    """NAPL transport equation RHS."""
+    if HAS_NUMBA:
+        # Fused path: compute k_n, H_n on-the-fly inside kernel
+        return _sph_dSndt_fused(h_field, Sn_field, yp, _skip_napl,
+                                 nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                                 L_inv, K_norm, err_x, err_y, Vp, N_part, phi_0)
+    else:
+        # Fallback: fields already computed by compute_dhdt's _precompute_step
+        return _div_k_gradH(_fld_Hn, _fld_kn, _fld_Cn, ptype, _skip_napl,
+                             nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
+                             L_inv, K_norm, err_x, err_y, Vp, N_part)
 
-    dSndt = np.zeros(N_part)
-
-    for i in range(N_part):
-        if ptype[i] == 1 or ptype[i] == 2:
-            continue
-        if is_source[i]:
-            continue
-
-        Hni = H_n[i]
-        kni = k_n[i]
-
-        # corrected gradient of H_n
-        raw_gx = 0.0; raw_gy = 0.0
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            dHn = H_n[j] - Hni
-            raw_gx += Vp * dHn * gWx
-            raw_gy += Vp * dHn * gWy
-        Li = L_inv[i]
-        grad_Hx = Li[0, 0] * raw_gx + Li[0, 1] * raw_gy
-        grad_Hy = Li[1, 0] * raw_gx + Li[1, 1] * raw_gy
-
-        # variable-kn Laplacian
-        lap_sum = 0.0
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            kn_mean = 0.5 * (kni + k_n[j])
-            lap_sum += Vp * kn_mean * (H_n[j] - Hni) * Fhat
-
-        corr = kni * (grad_Hx * err_x[i] + grad_Hy * err_y[i])
-
-        Kn_val = K_norm[i]
-        if abs(Kn_val) < 1e-30:
-            continue
-
-        rhs = (2.0 / Kn_val) * (lap_sum - corr)
-        dSndt[i] = rhs / phi_0
-
-    return dSndt
-
-
-# ======================================================================
-# 10.  DARCY VELOCITY   q = -k grad(H)    [Paper Eq. 60 + sign]
-# ======================================================================
-#
-# Paper Eq. 60 computes  sum V_j k_ij (H_j-H_i) grad_W_ij  which is
-# the SPH-consistent approximation of  k * grad(H).
-# Physical Darcy velocity:  q = -k grad(H),  so we negate.
 
 def compute_darcy_velocity(h_field, Sn_field):
-    """Water Darcy velocity  q_w = -k_w grad(H_w)  (three-phase)."""
-    k_h = compute_kw_3ph(h_field, Sn_field)
-    H_f = h_field + yp
-
-    qx = np.zeros(N_part)
-    qy = np.zeros(N_part)
-
-    for i in range(N_part):
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            k_mean = 0.5 * (k_h[i] + k_h[j])
-            dH = H_f[j] - H_f[i]
-            # Corrected kernel gradient
-            L = L_inv[i]
-            cWx = L[0, 0] * gWx + L[0, 1] * gWy
-            cWy = L[1, 0] * gWx + L[1, 1] * gWy
-            qx[i] += Vp * k_mean * dH * cWx
-            qy[i] += Vp * k_mean * dH * cWy
-
-    # q = -k grad(H)  =>  negate the SPH approximation of k*grad(H)
+    """Water Darcy velocity  q_w = -k_w grad(H_w)."""
+    _precompute_step(h_field, Sn_field)    # ensures fields are fresh
+    qx, qy = _kvar_gradient(_fld_Hw, _fld_kw, nbr_ptr, nbr_j,
+                              nbr_gWx, nbr_gWy, L_inv, Vp, N_part)
     return -qx, -qy
 
 
 def compute_darcy_velocity_napl(h_field, Sn_field):
     """NAPL Darcy velocity  q_n = -k_n grad(H_n)."""
-    k_n = compute_kn_field(h_field, Sn_field)
-    H_n = compute_Hn_field(h_field, Sn_field)
-
-    qx = np.zeros(N_part)
-    qy = np.zeros(N_part)
-
-    for i in range(N_part):
-        for (j, rij, xji, yji, Fhat, gWx, gWy) in neighbours[i]:
-            kn_mean = 0.5 * (k_n[i] + k_n[j])
-            dHn = H_n[j] - H_n[i]
-            L = L_inv[i]
-            cWx = L[0, 0] * gWx + L[0, 1] * gWy
-            cWy = L[1, 0] * gWx + L[1, 1] * gWy
-            qx[i] += Vp * kn_mean * dHn * cWx
-            qy[i] += Vp * kn_mean * dHn * cWy
-
+    # Fields already fresh from compute_darcy_velocity call
+    qx, qy = _kvar_gradient(_fld_Hn, _fld_kn, nbr_ptr, nbr_j,
+                              nbr_gWx, nbr_gWy, L_inv, Vp, N_part)
     return -qx, -qy
 
 
 # ======================================================================
 # 11.  TIME STEP   [Paper Eq. 66 / Appendix A.17]
 # ======================================================================
-CFL = 0.1
+CFL = 0.25
 
 def stable_dt(h_field, Sn_field):
     Cs = compute_Cs(h_field)
@@ -890,10 +1204,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 5000000          # adjust as needed
-snapshot_every = 1000
-print_every    = 500
-ckpt_every     = 10*snapshot_every
+N_steps_max    = 2000          # adjust as needed
+snapshot_every = 200
+print_every    = 100
+ckpt_every     = 500
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
@@ -996,11 +1310,9 @@ for step in range(start_step, N_steps_max + 1):
 
     S_n = np.clip(S_n, 0.0, 1.0 - S_res)
 
-    for i in range(N_part):
-        if ptype[i] == 1:  h_w[i] = H_u - yp[i]
-        if ptype[i] == 2:  h_w[i] = H_d - yp[i]
-    h_w = enforce_impermeable_bc(h_w)
-    S_n = enforce_napl_bc(S_n)
+    enforce_dirichlet_bc(h_w)
+    enforce_impermeable_bc(h_w)
+    enforce_napl_bc(S_n)
 
     t_phys += dt
 
