@@ -35,11 +35,11 @@ import numpy as np
 # ======================================================================
 # CONFIGURATION  — edit these
 # ======================================================================
-GRID_SIZES    = [51, 101, 201]       # Nx = Ny values to test
-THREAD_COUNTS = [1, 2, 4, 8]        # NUMBA_NUM_THREADS values
-N_STEPS       = 5000               # steps per benchmark (enough for timing)
+GRID_SIZES    = [51, 101, 201, 401]       # Nx = Ny values to test
+THREAD_COUNTS = [1, 2, 4, 8, 16]        # NUMBA_NUM_THREADS values
+N_STEPS       = 500               # steps per benchmark (enough for timing)
 BENCHMARK_SCRIPT = "benchmark_sph.py"
-OUT_DIR       = "scaling_results"
+OUT_DIR       = "/Users/michele/SPH/scaling_results"
 
 # ======================================================================
 # AUTO-DETECT
