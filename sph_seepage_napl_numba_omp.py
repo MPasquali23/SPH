@@ -52,7 +52,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph/"
+OUTPUT_DIR = "../data_sph/omp/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -350,6 +350,131 @@ def compute_Cs(h):
 
 S_wir = S_res   # irreducible (residual) water saturation
 
+# Precompute ratio (used in H_n calculation)
+_gamma_ratio = gamma_w / gamma_n
+_inv_alpha_nw = 1.0 / alpha_nw
+_inv_m = 1.0 / m_vG
+_inv_n = 1.0 / n_vG
+
+# ── Scalar Numba constitutive helpers ────────────────────────────────
+#
+# These are called per-particle inside prange loops.  They access
+# module-level scalar constants (k_sat, m_vG, etc.) which Numba
+# captures at compile time.  inline='always' eliminates call overhead.
+
+if HAS_NUMBA:
+    @njit(inline='always')
+    def _s_Sw(hw, sn):
+        """Scalar water saturation."""
+        if hw >= 0.0:
+            sw = S_sat
+        else:
+            sw = S_wir + (1.0 - S_wir) * (1.0 + (g_a * abs(hw))**n_vG)**(-m_vG)
+        cap = 1.0 - sn
+        if sw > cap:
+            sw = cap
+        if sw < S_wir:
+            sw = S_wir
+        if sw > S_sat:
+            sw = S_sat
+        return sw
+
+    @njit(inline='always')
+    def _s_Sew(sw):
+        """Scalar effective water saturation."""
+        v = (sw - S_wir) / (1.0 - S_wir)
+        if v < 1e-14:  v = 1e-14
+        if v > 1.0 - 1e-10:  v = 1.0 - 1e-10
+        return v
+
+    @njit(inline='always')
+    def _s_Set(sw, sn):
+        """Scalar effective total-liquid saturation."""
+        v = (sw + sn - S_wir) / (1.0 - S_wir)
+        if v < 1e-14:  v = 1e-14
+        if v > 1.0 - 1e-10:  v = 1.0 - 1e-10
+        return v
+
+    @njit(inline='always')
+    def _s_kw(hw, sn):
+        """Scalar water hydraulic conductivity."""
+        if hw >= 0.0 and sn < 1e-12:
+            return k_sat
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        inner = 1.0 - sew**_inv_m
+        if inner < 0.0: inner = 0.0
+        if inner > 1.0: inner = 1.0
+        kr = sew**g_l * (1.0 - inner**m_vG)**2
+        if kr < 0.0: kr = 0.0
+        if kr > 1.0: kr = 1.0
+        return k_sat * kr
+
+    @njit(inline='always')
+    def _s_kn(hw, sn):
+        """Scalar NAPL hydraulic conductivity."""
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        st  = _s_Set(sw, sn)
+        se_n = st - sew
+        if se_n < 1e-14: se_n = 1e-14
+        tw = (1.0 - sew**_inv_m)**m_vG
+        if tw < 0.0: tw = 0.0
+        if tw > 1.0: tw = 1.0
+        tt = (1.0 - st**_inv_m)**m_vG
+        if tt < 0.0: tt = 0.0
+        if tt > 1.0: tt = 1.0
+        diff = tw - tt
+        if diff < 0.0: diff = 0.0
+        kr = se_n**g_l * diff**2
+        if kr < 0.0: kr = 0.0
+        if kr > 1.0: kr = 1.0
+        return k_sat_n * kr
+
+    @njit(inline='always')
+    def _s_Hn(hw, sn, yp_i):
+        """Scalar NAPL hydraulic head."""
+        sw = _s_Sw(hw, sn)
+        sew = _s_Sew(sw)
+        base = sew**(-_inv_m) - 1.0
+        if base < 0.0: base = 0.0
+        if base > 1e12: base = 1e12
+        h_cnw = _inv_alpha_nw * base**_inv_n
+        return _gamma_ratio * (hw + h_cnw) + yp_i
+
+    @njit(inline='always')
+    def _s_Ctilde(hw):
+        """Scalar total storage coefficient C_tilde = max(C_l + Cs, C_l)."""
+        if hw >= 0.0:
+            return C_l
+        ah = abs(hw)
+        ahn = (g_a * ah)**n_vG
+        dSr = ((S_sat - S_res) * m_vG * n_vG * g_a
+               * (g_a * ah)**(n_vG - 1.0)
+               / (1.0 + ahn)**(m_vG + 1.0))
+        Cs = phi_0 * dSr
+        ct = C_l + Cs
+        if ct < C_l:
+            ct = C_l
+        return ct
+
+    # ── Fused precompute: all 5 constitutive fields in one prange ────
+    @njit(cache=True, parallel=True)
+    def _precompute_fields(h_w, S_n, yp_arr, N,
+                           kw_out, Hw_out, Ct_out, kn_out, Hn_out):
+        """Compute kw, Hw, C_tilde, kn, Hn for all particles in parallel."""
+        for i in prange(N):
+            hw_i = h_w[i]
+            sn_i = S_n[i]
+            kw_out[i] = _s_kw(hw_i, sn_i)
+            Hw_out[i] = hw_i + yp_arr[i]
+            Ct_out[i] = _s_Ctilde(hw_i)
+            kn_out[i] = _s_kn(hw_i, sn_i)
+            Hn_out[i] = _s_Hn(hw_i, sn_i, yp_arr[i])
+
+
+# ── NumPy vectorised constitutive functions (kept for fallback + plots) ─
+
 
 def compute_Sw_3ph(h_w, S_n):
     """Water saturation from VG(h_w), capped so S_w + S_n <= 1."""
@@ -418,7 +543,7 @@ def compute_kn_field(h_w, S_n):
     return k_sat_n * compute_krn(h_w, S_n)
 
 
-def compute_Hn_field_np(h_w, S_n):
+def compute_Hn_field(h_w, S_n):
     """NAPL hydraulic head.
     H_n = (gamma_w / gamma_n) * (h_w + h_cnw) + z
 
@@ -431,160 +556,6 @@ def compute_Hn_field_np(h_w, S_n):
     h_cnw = (1.0 / alpha_nw) * base**(1.0 / n_vG)
 
     return (gamma_w / gamma_n) * (h_w + h_cnw) + yp
-
-
-# ----------------------------------------------------------------------
-# 6c. NUMBA-JITTED CONSTITUTIVE KERNELS
-# ----------------------------------------------------------------------
-#
-# Element-wise constitutive evaluations written as per-particle loops
-# parallelised with numba.prange.  Module-level constants (S_sat, S_res,
-# S_wir, m_vG, n_vG, g_a, phi_0, k_sat, k_sat_n, alpha_nw, gamma_w,
-# gamma_n, g_l) are captured as compile-time constants at JIT time.
-
-if HAS_NUMBA:
-    from numba import prange as _prange_c
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_Cs_nb(h):
-        N = h.shape[0]
-        out = np.zeros(N)
-        for i in _prange_c(N):
-            hi = h[i]
-            if hi < 0.0:
-                ah  = -hi
-                gah = g_a * ah
-                ahn = gah ** n_vG
-                out[i] = phi_0 * ((S_sat - S_res) * m_vG * n_vG * g_a
-                                   * gah ** (n_vG - 1.0)
-                                   / (1.0 + ahn) ** (m_vG + 1.0))
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_kw_3ph_nb(h_w, S_n):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        for i in _prange_c(N):
-            hi  = h_w[i]
-            sni = S_n[i]
-            # --- Sw from VG, capped at (1 - S_n) ---
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            # --- Sew ---
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            # --- kr_w ---
-            inner = 1.0 - Sew ** (1.0 / m_vG)
-            if inner < 0.0: inner = 0.0
-            if inner > 1.0: inner = 1.0
-            kr = Sew ** g_l * (1.0 - inner ** m_vG) ** 2
-            if kr < 0.0: kr = 0.0
-            if kr > 1.0: kr = 1.0
-            kv = k_sat * kr
-            if hi >= 0.0 and sni < 1e-12:
-                kv = k_sat
-            out[i] = kv
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_kn_nb(h_w, S_n):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        for i in _prange_c(N):
-            hi  = h_w[i]
-            sni = S_n[i]
-            # --- Sw ---
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            # --- Sew, Set ---
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            Set_v = (Sw + sni - S_wir) / one_minus_wir
-            if Set_v < 1e-14:       Set_v = 1e-14
-            if Set_v > 1.0 - 1e-10: Set_v = 1.0 - 1e-10
-            # --- kr_n ---
-            Se_n = Set_v - Sew
-            if Se_n < 1e-14: Se_n = 1e-14
-            tw_a = 1.0 - Sew ** (1.0 / m_vG)
-            if tw_a < 0.0: tw_a = 0.0
-            if tw_a > 1.0: tw_a = 1.0
-            tt_a = 1.0 - Set_v ** (1.0 / m_vG)
-            if tt_a < 0.0: tt_a = 0.0
-            if tt_a > 1.0: tt_a = 1.0
-            term_w = tw_a ** m_vG
-            term_t = tt_a ** m_vG
-            diff   = term_w - term_t
-            if diff < 0.0: diff = 0.0
-            kr = Se_n ** g_l * diff ** 2
-            if kr < 0.0: kr = 0.0
-            if kr > 1.0: kr = 1.0
-            out[i] = k_sat_n * kr
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_Hn_nb(h_w, S_n, yp_arr):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        ratio     = gamma_w / gamma_n
-        inv_alpha = 1.0 / alpha_nw
-        for i in _prange_c(N):
-            hi  = h_w[i]
-            sni = S_n[i]
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            base = Sew ** (-1.0 / m_vG) - 1.0
-            if base < 0.0: base = 0.0
-            if base > 1e12: base = 1e12
-            h_cnw = inv_alpha * base ** (1.0 / n_vG)
-            out[i] = ratio * (hi + h_cnw) + yp_arr[i]
-        return out
-
-    # --- Dispatching wrappers: shadow the NumPy versions above ---
-    def compute_Cs(h):
-        return _compute_Cs_nb(h)
-
-    def compute_kw_3ph(h_w, S_n):
-        return _compute_kw_3ph_nb(h_w, S_n)
-
-    def compute_kn_field(h_w, S_n):
-        return _compute_kn_nb(h_w, S_n)
-
-    def compute_Hn_field(h_w, S_n):
-        return _compute_Hn_nb(h_w, S_n, yp)
-
-else:
-    # Pure-Python / NumPy fallback — alias to original vectorised versions
-    def compute_Hn_field(h_w, S_n):
-        return compute_Hn_field_np(h_w, S_n)
 
 
 # ======================================================================
@@ -860,43 +831,59 @@ _kvar_gradient = _sph_kvar_gradient if HAS_NUMBA else _sph_kvar_gradient_py
 _skip_dirichlet = (ptype == 1) | (ptype == 2)
 _skip_napl      = _skip_dirichlet | is_source
 
+# Pre-allocate reusable field arrays (avoids allocation every step)
+_fld_kw = np.empty(N_part)
+_fld_Hw = np.empty(N_part)
+_fld_Ct = np.empty(N_part)
+_fld_kn = np.empty(N_part)
+_fld_Hn = np.empty(N_part)
+_fld_Cn = np.full(N_part, phi_0)    # constant, never changes
+
+
+def _precompute_step(h_field, Sn_field):
+    """Compute all constitutive fields for both phases.
+    Uses Numba prange (parallel) if available, else NumPy (serial).
+    """
+    if HAS_NUMBA:
+        _precompute_fields(h_field, Sn_field, yp, N_part,
+                           _fld_kw, _fld_Hw, _fld_Ct, _fld_kn, _fld_Hn)
+    else:
+        _fld_kw[:] = compute_kw_3ph(h_field, Sn_field)
+        _fld_Hw[:] = h_field + yp
+        Cs = compute_Cs(h_field)
+        np.maximum(C_l + Cs, C_l, out=_fld_Ct)
+        _fld_kn[:] = compute_kn_field(h_field, Sn_field)
+        _fld_Hn[:] = compute_Hn_field(h_field, Sn_field)
+
+
 def compute_dhdt(h_field, Sn_field):
     """RHS of the water seepage equation (three-phase k_w)."""
-    k_h     = compute_kw_3ph(h_field, Sn_field)
-    Cs      = compute_Cs(h_field)
-    H_f     = h_field + yp
-    C_tilde = np.maximum(C_l + Cs, C_l)
-
-    return _div_k_gradH(H_f, k_h, C_tilde, ptype, _skip_dirichlet,
+    _precompute_step(h_field, Sn_field)
+    return _div_k_gradH(_fld_Hw, _fld_kw, _fld_Ct, ptype, _skip_dirichlet,
                          nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
                          L_inv, K_norm, err_x, err_y, Vp, N_part)
 
 
 def compute_dSndt(h_field, Sn_field):
     """NAPL transport equation RHS."""
-    k_n     = compute_kn_field(h_field, Sn_field)
-    H_n     = compute_Hn_field(h_field, Sn_field)
-    C_store = np.full(N_part, phi_0)
-
-    return _div_k_gradH(H_n, k_n, C_store, ptype, _skip_napl,
+    # Fields already computed by compute_dhdt's _precompute_step
+    return _div_k_gradH(_fld_Hn, _fld_kn, _fld_Cn, ptype, _skip_napl,
                          nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy,
                          L_inv, K_norm, err_x, err_y, Vp, N_part)
 
 
 def compute_darcy_velocity(h_field, Sn_field):
     """Water Darcy velocity  q_w = -k_w grad(H_w)."""
-    k_h = compute_kw_3ph(h_field, Sn_field)
-    H_f = h_field + yp
-    qx, qy = _kvar_gradient(H_f, k_h, nbr_ptr, nbr_j,
+    _precompute_step(h_field, Sn_field)    # ensures fields are fresh
+    qx, qy = _kvar_gradient(_fld_Hw, _fld_kw, nbr_ptr, nbr_j,
                               nbr_gWx, nbr_gWy, L_inv, Vp, N_part)
     return -qx, -qy
 
 
 def compute_darcy_velocity_napl(h_field, Sn_field):
     """NAPL Darcy velocity  q_n = -k_n grad(H_n)."""
-    k_n = compute_kn_field(h_field, Sn_field)
-    H_n = compute_Hn_field(h_field, Sn_field)
-    qx, qy = _kvar_gradient(H_n, k_n, nbr_ptr, nbr_j,
+    # Fields already fresh from compute_darcy_velocity call
+    qx, qy = _kvar_gradient(_fld_Hn, _fld_kn, nbr_ptr, nbr_j,
                               nbr_gWx, nbr_gWy, L_inv, Vp, N_part)
     return -qx, -qy
 

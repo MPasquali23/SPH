@@ -258,146 +258,91 @@ def compute_kw_3ph(h_w, S_n):
 def compute_kn_field(h_w, S_n):
     return k_sat_n * compute_krn(h_w, S_n)
 
-def compute_Hn_field_np(h_w, S_n):
+def compute_Hn_field(h_w, S_n):
     Sew=compute_Sew(h_w,S_n)
     base=np.clip(Sew**(-1/m_vG)-1,0,1e12)
     h_cnw=(1/alpha_nw)*base**(1/n_vG)
     return (gamma_w/gamma_n)*(h_w+h_cnw)+yp
 
-# ----------------------------------------------------------------------
-# NUMBA-JITTED CONSTITUTIVE KERNELS
-# ----------------------------------------------------------------------
-# Element-wise per-particle loops parallelised with prange.  Module-level
-# constants are captured as compile-time constants.
+# Precomputed constants for scalar helpers
+_gamma_ratio = gamma_w / gamma_n
+_inv_alpha_nw = 1.0 / alpha_nw
+_inv_m = 1.0 / m_vG
+_inv_n = 1.0 / n_vG
+
 if HAS_NUMBA:
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_Cs_nb(h):
-        N = h.shape[0]
-        out = np.zeros(N)
+    @njit(inline='always')
+    def _s_Sw(hw, sn):
+        if hw >= 0.0: sw = S_sat
+        else: sw = S_wir + (1.0-S_wir)*(1.0+(g_a*abs(hw))**n_vG)**(-m_vG)
+        cap = 1.0 - sn
+        if sw > cap: sw = cap
+        if sw < S_wir: sw = S_wir
+        if sw > S_sat: sw = S_sat
+        return sw
+    @njit(inline='always')
+    def _s_Sew(sw):
+        v = (sw - S_wir)/(1.0-S_wir)
+        if v < 1e-14: v = 1e-14
+        if v > 1.0-1e-10: v = 1.0-1e-10
+        return v
+    @njit(inline='always')
+    def _s_Set(sw, sn):
+        v = (sw+sn-S_wir)/(1.0-S_wir)
+        if v < 1e-14: v = 1e-14
+        if v > 1.0-1e-10: v = 1.0-1e-10
+        return v
+    @njit(inline='always')
+    def _s_kw(hw, sn):
+        if hw >= 0.0 and sn < 1e-12: return k_sat
+        sw=_s_Sw(hw,sn); sew=_s_Sew(sw)
+        inner=1.0-sew**_inv_m
+        if inner<0: inner=0.0
+        if inner>1: inner=1.0
+        kr=sew**g_l*(1.0-inner**m_vG)**2
+        if kr<0: kr=0.0
+        if kr>1: kr=1.0
+        return k_sat*kr
+    @njit(inline='always')
+    def _s_kn(hw, sn):
+        sw=_s_Sw(hw,sn); sew=_s_Sew(sw); st=_s_Set(sw,sn)
+        se_n=st-sew
+        if se_n<1e-14: se_n=1e-14
+        tw=(1.0-sew**_inv_m)**m_vG
+        if tw<0: tw=0.0
+        if tw>1: tw=1.0
+        tt=(1.0-st**_inv_m)**m_vG
+        if tt<0: tt=0.0
+        if tt>1: tt=1.0
+        diff=tw-tt
+        if diff<0: diff=0.0
+        kr=se_n**g_l*diff**2
+        if kr<0: kr=0.0
+        if kr>1: kr=1.0
+        return k_sat_n*kr
+    @njit(inline='always')
+    def _s_Hn(hw, sn, yp_i):
+        sw=_s_Sw(hw,sn); sew=_s_Sew(sw)
+        base=sew**(-_inv_m)-1.0
+        if base<0: base=0.0
+        if base>1e12: base=1e12
+        h_cnw=_inv_alpha_nw*base**_inv_n
+        return _gamma_ratio*(hw+h_cnw)+yp_i
+    @njit(inline='always')
+    def _s_Ctilde(hw):
+        if hw >= 0.0: return C_l
+        ah=abs(hw); ahn=(g_a*ah)**n_vG
+        dSr=(S_sat-S_res)*m_vG*n_vG*g_a*(g_a*ah)**(n_vG-1.0)/(1.0+ahn)**(m_vG+1.0)
+        ct=C_l+phi_0*dSr
+        if ct<C_l: ct=C_l
+        return ct
+    @njit(cache=True, parallel=True)
+    def _precompute_fields(h_w, S_n, yp_arr, N, kw_o, Hw_o, Ct_o, kn_o, Hn_o):
         for i in prange(N):
-            hi = h[i]
-            if hi < 0.0:
-                ah  = -hi
-                gah = g_a * ah
-                ahn = gah ** n_vG
-                out[i] = phi_0 * ((S_sat - S_res) * m_vG * n_vG * g_a
-                                   * gah ** (n_vG - 1.0)
-                                   / (1.0 + ahn) ** (m_vG + 1.0))
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_kw_3ph_nb(h_w, S_n):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        for i in prange(N):
-            hi  = h_w[i]; sni = S_n[i]
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            inner = 1.0 - Sew ** (1.0 / m_vG)
-            if inner < 0.0: inner = 0.0
-            if inner > 1.0: inner = 1.0
-            kr = Sew ** g_l * (1.0 - inner ** m_vG) ** 2
-            if kr < 0.0: kr = 0.0
-            if kr > 1.0: kr = 1.0
-            kv = k_sat * kr
-            if hi >= 0.0 and sni < 1e-12:
-                kv = k_sat
-            out[i] = kv
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_kn_nb(h_w, S_n):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        for i in prange(N):
-            hi  = h_w[i]; sni = S_n[i]
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            Set_v = (Sw + sni - S_wir) / one_minus_wir
-            if Set_v < 1e-14:       Set_v = 1e-14
-            if Set_v > 1.0 - 1e-10: Set_v = 1.0 - 1e-10
-            Se_n = Set_v - Sew
-            if Se_n < 1e-14: Se_n = 1e-14
-            tw_a = 1.0 - Sew ** (1.0 / m_vG)
-            if tw_a < 0.0: tw_a = 0.0
-            if tw_a > 1.0: tw_a = 1.0
-            tt_a = 1.0 - Set_v ** (1.0 / m_vG)
-            if tt_a < 0.0: tt_a = 0.0
-            if tt_a > 1.0: tt_a = 1.0
-            diff = tw_a ** m_vG - tt_a ** m_vG
-            if diff < 0.0: diff = 0.0
-            kr = Se_n ** g_l * diff ** 2
-            if kr < 0.0: kr = 0.0
-            if kr > 1.0: kr = 1.0
-            out[i] = k_sat_n * kr
-        return out
-
-    @njit(cache=True, parallel=True, fastmath=True)
-    def _compute_Hn_nb(h_w, S_n, yp_arr):
-        N = h_w.shape[0]
-        out = np.empty(N)
-        one_minus_wir = 1.0 - S_wir
-        ratio     = gamma_w / gamma_n
-        inv_alpha = 1.0 / alpha_nw
-        for i in prange(N):
-            hi  = h_w[i]; sni = S_n[i]
-            if hi >= 0.0:
-                Sw_vg = S_sat
-            else:
-                Sw_vg = S_wir + one_minus_wir \
-                         * (1.0 + (g_a * (-hi)) ** n_vG) ** (-m_vG)
-            cap = 1.0 - sni
-            Sw  = Sw_vg if Sw_vg < cap else cap
-            if Sw < S_wir: Sw = S_wir
-            if Sw > S_sat: Sw = S_sat
-            Sew = (Sw - S_wir) / one_minus_wir
-            if Sew < 1e-14:       Sew = 1e-14
-            if Sew > 1.0 - 1e-10: Sew = 1.0 - 1e-10
-            base = Sew ** (-1.0 / m_vG) - 1.0
-            if base < 0.0:  base = 0.0
-            if base > 1e12: base = 1e12
-            h_cnw = inv_alpha * base ** (1.0 / n_vG)
-            out[i] = ratio * (hi + h_cnw) + yp_arr[i]
-        return out
-
-    # --- Dispatching wrappers: shadow NumPy versions ---
-    def compute_Cs(h):
-        return _compute_Cs_nb(h)
-
-    def compute_kw_3ph(h_w, S_n):
-        return _compute_kw_3ph_nb(h_w, S_n)
-
-    def compute_kn_field(h_w, S_n):
-        return _compute_kn_nb(h_w, S_n)
-
-    def compute_Hn_field(h_w, S_n):
-        return _compute_Hn_nb(h_w, S_n, yp)
-
-else:
-    def compute_Hn_field(h_w, S_n):
-        return compute_Hn_field_np(h_w, S_n)
+            hw_i=h_w[i]; sn_i=S_n[i]
+            kw_o[i]=_s_kw(hw_i,sn_i); Hw_o[i]=hw_i+yp_arr[i]
+            Ct_o[i]=_s_Ctilde(hw_i)
+            kn_o[i]=_s_kn(hw_i,sn_i); Hn_o[i]=_s_Hn(hw_i,sn_i,yp_arr[i])
 
 # ======================================================================
 # PARTICLE CLASSIFICATION + INITIAL CONDITIONS
@@ -479,17 +424,27 @@ else:
         return out
 
 
+# Pre-allocate field arrays
+_fld_kw = np.empty(N_part); _fld_Hw = np.empty(N_part)
+_fld_Ct = np.empty(N_part); _fld_kn = np.empty(N_part)
+_fld_Hn = np.empty(N_part); _fld_Cn = np.full(N_part, phi_0)
+
+def _precompute_step(hw, Sn):
+    if HAS_NUMBA:
+        _precompute_fields(hw, Sn, yp, N_part, _fld_kw, _fld_Hw, _fld_Ct, _fld_kn, _fld_Hn)
+    else:
+        _fld_kw[:]=compute_kw_3ph(hw,Sn); _fld_Hw[:]=hw+yp
+        Cs=compute_Cs(hw); np.maximum(C_l+Cs,C_l,out=_fld_Ct)
+        _fld_kn[:]=compute_kn_field(hw,Sn); _fld_Hn[:]=compute_Hn_field(hw,Sn)
+
 def compute_dhdt(hw, Sn):
-    k_h=compute_kw_3ph(hw,Sn); Cs=compute_Cs(hw); Hf=hw+yp
-    Ct=np.maximum(C_l+Cs,C_l)
-    return _sph_div_k_gradH(Hf,k_h,Ct,_skip_dirichlet,
+    _precompute_step(hw, Sn)
+    return _sph_div_k_gradH(_fld_Hw,_fld_kw,_fld_Ct,_skip_dirichlet,
                              nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
                              L_inv,K_norm,err_x,err_y,Vp,N_part)
 
 def compute_dSndt(hw, Sn):
-    kn=compute_kn_field(hw,Sn); Hn=compute_Hn_field(hw,Sn)
-    Cs_n=np.full(N_part,phi_0)
-    return _sph_div_k_gradH(Hn,kn,Cs_n,_skip_napl,
+    return _sph_div_k_gradH(_fld_Hn,_fld_kn,_fld_Cn,_skip_napl,
                              nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
                              L_inv,K_norm,err_x,err_y,Vp,N_part)
 
@@ -557,24 +512,18 @@ t_loop0 = wall_time.perf_counter()
 for step in range(1, N_steps + 1):
     dt = stable_dt(h_w, S_n)
 
-    # -- Constitutive (NumPy) --
+    # -- Constitutive (fused Numba prange or NumPy fallback) --
     tc0 = wall_time.perf_counter()
-    k_w  = compute_kw_3ph(h_w, S_n)
-    Cs   = compute_Cs(h_w)
-    Hw   = h_w + yp
-    Ct   = np.maximum(C_l + Cs, C_l)
-    k_n  = compute_kn_field(h_w, S_n)
-    Hn   = compute_Hn_field(h_w, S_n)
-    Cs_n = np.full(N_part, phi_0)
+    _precompute_step(h_w, S_n)
     tc1 = wall_time.perf_counter()
     t_constitutive += tc1 - tc0
 
     # -- SPH kernels --
     tk0 = wall_time.perf_counter()
-    dhdt  = _sph_div_k_gradH(Hw, k_w, Ct, _skip_dirichlet,
+    dhdt  = _sph_div_k_gradH(_fld_Hw, _fld_kw, _fld_Ct, _skip_dirichlet,
                                nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
                                L_inv,K_norm,err_x,err_y, Vp, N_part)
-    dSndt = _sph_div_k_gradH(Hn, k_n, Cs_n, _skip_napl,
+    dSndt = _sph_div_k_gradH(_fld_Hn, _fld_kn, _fld_Cn, _skip_napl,
                                nbr_ptr,nbr_j,nbr_Fhat,nbr_gWx,nbr_gWy,
                                L_inv,K_norm,err_x,err_y, Vp, N_part)
     tk1 = wall_time.perf_counter()
