@@ -697,9 +697,25 @@ _dz_back  = zp[_mirror_back]  - zp[_idx_back]    # = 0 for y-faces
 _h_dirichlet_left  = H_u - zp[_idx_left]
 _h_dirichlet_right = H_d - zp[_idx_right]
 
+# Precompute "source-conflict" indices for impermeable boundaries.
+# A boundary cell whose interior mirror is a source particle would otherwise
+# inherit Sn = SN_SOURCE through the zero-gradient mirror BC, making the
+# source visually (and physically) leak through the impermeable wall.
+# We override these cells with Sn = 0 to keep the source strictly inside.
+# This is a pure-resolution safeguard: at fine grids it's a no-op.
+_idx_bot_srcconf   = _idx_bot[is_source[_mirror_bot]]
+_idx_top_srcconf   = _idx_top[is_source[_mirror_top]]
+_idx_front_srcconf = _idx_front[is_source[_mirror_front]]
+_idx_back_srcconf  = _idx_back[is_source[_mirror_back]]
+_n_srcconf = (len(_idx_bot_srcconf) + len(_idx_top_srcconf)
+              + len(_idx_front_srcconf) + len(_idx_back_srcconf))
+
 print(f"BC indices precomputed:  left={len(_idx_left)}  right={len(_idx_right)}  "
       f"bot={len(_idx_bot)}  top={len(_idx_top)}  "
       f"front={len(_idx_front)}  back={len(_idx_back)}  source={len(_idx_src)}")
+if _n_srcconf > 0:
+    print(f"  WARNING: {_n_srcconf} impermeable-boundary cells have a source as mirror "
+          f"(will be forced to Sn=0 to avoid wall leakage; consider finer grid)")
 
 
 def enforce_impermeable_bc(h_field):
@@ -719,14 +735,23 @@ def enforce_dirichlet_bc(h_field):
 
 
 def enforce_napl_bc(Sn):
-    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable, source (vectorised)."""
+    """NAPL BCs: Sn=0 at Dirichlet walls, mirror at impermeable, source (vectorised).
+    Boundary cells whose mirror is a source are overridden to Sn=0 to prevent
+    coarse-grid leakage through the impermeable walls.
+    """
     Sn[_idx_left]  = 0.0
     Sn[_idx_right] = 0.0
     Sn[_idx_bot]   = Sn[_mirror_bot]
     Sn[_idx_top]   = Sn[_mirror_top]
     Sn[_idx_front] = Sn[_mirror_front]
     Sn[_idx_back]  = Sn[_mirror_back]
-    Sn[_idx_src]   = SN_SOURCE
+    # Source-conflict override: zero out impermeable-boundary cells whose
+    # mirror is a source (otherwise they inherit SN_SOURCE through the mirror).
+    Sn[_idx_bot_srcconf]   = 0.0
+    Sn[_idx_top_srcconf]   = 0.0
+    Sn[_idx_front_srcconf] = 0.0
+    Sn[_idx_back_srcconf]  = 0.0
+    Sn[_idx_src] = SN_SOURCE
     return Sn
 
 

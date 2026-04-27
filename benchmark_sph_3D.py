@@ -499,6 +499,12 @@ _dz_back  = zp[_mirror_back]  - zp[_idx_back]
 _h_dir_left  = H_u - zp[_idx_left]
 _h_dir_right = H_d - zp[_idx_right]
 
+# Source-conflict override (see sph_seepage_napl.py for rationale)
+_idx_bot_srcconf   = _idx_bot[is_source[_mirror_bot]]
+_idx_top_srcconf   = _idx_top[is_source[_mirror_top]]
+_idx_front_srcconf = _idx_front[is_source[_mirror_front]]
+_idx_back_srcconf  = _idx_back[is_source[_mirror_back]]
+
 def enforce_bcs(hw, Sn):
     hw[_idx_left]  = _h_dir_left
     hw[_idx_right] = _h_dir_right
@@ -511,6 +517,11 @@ def enforce_bcs(hw, Sn):
     Sn[_idx_top]   = Sn[_mirror_top]
     Sn[_idx_front] = Sn[_mirror_front]
     Sn[_idx_back]  = Sn[_mirror_back]
+    # Source-conflict override: prevent source leaking through impermeable walls at coarse grids
+    Sn[_idx_bot_srcconf]   = 0.0
+    Sn[_idx_top_srcconf]   = 0.0
+    Sn[_idx_front_srcconf] = 0.0
+    Sn[_idx_back_srcconf]  = 0.0
     Sn[_idx_src]   = SN_SOURCE
 
 # ======================================================================
