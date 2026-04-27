@@ -35,11 +35,17 @@ import numpy as np
 # ======================================================================
 # CONFIGURATION  — edit these
 # ======================================================================
-GRID_SIZES    = [51, 101, 201, 401]       # Nx = Ny values to test
-THREAD_COUNTS = [1, 2, 4, 8, 12]        # NUMBA_NUM_THREADS values
-N_STEPS       = 100               # steps per benchmark (enough for timing)
-BENCHMARK_SCRIPT = "benchmark_sph.py"
-OUT_DIR       = "/Users/michele/SPH/scaling_results"
+# Grid sizes: 3D so particles = Nx^3.  Adjust based on available memory.
+#   Nx=21  →   9,261 particles
+#   Nx=31  →  29,791 particles
+#   Nx=51  → 132,651 particles
+#   Nx=71  → 357,911 particles
+#   Nx=101 → 1,030,301 particles  (needs ~16 GB RAM)
+GRID_SIZES    = [21, 31, 51, 71]    # Nx = Ny = Nz values to test
+THREAD_COUNTS = [2, 4, 8, 12]     # NUMBA_NUM_THREADS values
+N_STEPS       = 100                    # steps per benchmark (enough for timing)
+BENCHMARK_SCRIPT = "benchmark_sph_3D.py"
+OUT_DIR       = "../data_sph/scaling_results"
 
 # ======================================================================
 # AUTO-DETECT
@@ -62,9 +68,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Check benchmark script exists
 if not os.path.exists(BENCHMARK_SCRIPT):
     # Try common locations
-    for alt in ["benchmark_sph.py",
-                os.path.join(os.path.dirname(__file__), "benchmark_sph.py"),
-                os.path.join("../outputs", "benchmark_sph.py")]:
+    for alt in ["benchmark_sph_3D.py",
+                os.path.join(os.path.dirname(__file__), "benchmark_sph_3D.py"),
+                os.path.join("/mnt/user-data/outputs", "benchmark_sph_3D.py")]:
         if os.path.exists(alt):
             BENCHMARK_SCRIPT = alt
             break
@@ -123,15 +129,16 @@ for nx in GRID_SIZES:
         ]
 
         try:
+            # 1800 s = 30 min per run — generous for 3D where 100^3 takes minutes
             proc = subprocess.run(cmd, env=env, capture_output=True,
-                                  text=True, timeout=600)
+                                  text=True, timeout=1800)
             print(proc.stdout[-500:] if len(proc.stdout) > 500 else proc.stdout)
             if proc.returncode != 0:
                 print(f"  STDERR: {proc.stderr[-300:]}")
                 print(f"  *** FAILED (exit code {proc.returncode}) ***")
                 continue
         except subprocess.TimeoutExpired:
-            print(f"  *** TIMEOUT (600 s) ***")
+            print(f"  *** TIMEOUT (1800 s) ***")
             continue
 
         # Parse results
