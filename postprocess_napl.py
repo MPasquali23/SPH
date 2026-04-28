@@ -51,6 +51,12 @@ parser.add_argument("--fps",    type=int, default=8,
                     help="Animation frame rate (default: 8)")
 parser.add_argument("--dpi",    type=int, default=120,
                     help="Output DPI (default: 120)")
+parser.add_argument("--alpha", type=float, default=0.7,
+                    help="Marker transparency (0=invisible, 1=opaque). "
+                         "Lower values reveal phase mixing more clearly. Default 0.7")
+parser.add_argument("--stream-threshold", type=float, default=0.02,
+                    help="Mask streamlines below this fraction of max |v| in each slice. "
+                         "Default 0.02 (2%%); set to 0 to disable masking.")
 args = parser.parse_args()
 
 os.makedirs(args.outdir, exist_ok=True)
@@ -209,30 +215,68 @@ def slice_xz(field3, iy):  return field3[:, iy, :]   # (Nx, Nz)
 # ======================================================================
 # PLOT 1: animated XZ + YZ slice with RGB scatter and streamlines
 # ======================================================================
-print("\nBuilding Plot 1 (slice animation with streamlines) ...", flush=True)
+print("\nBuilding Plot 1 (slice animation: particle scatter + streamlines) ...", flush=True)
+
+
+def mask_low_speed(u, v, threshold_frac):
+    """Return (u, v) with cells below threshold_frac * max(|v|) replaced by NaN.
+    streamplot skips integration through NaN cells, so faint flow regions are
+    not cluttered with spurious streamlines.
+
+    threshold_frac == 0  → no masking (all cells kept)
+    """
+    if threshold_frac <= 0.0:
+        return u, v
+    mag = np.sqrt(u*u + v*v)
+    mmax = float(mag.max())
+    if mmax < 1e-30:
+        return u, v
+    mask = mag < threshold_frac * mmax
+    if not mask.any():
+        return u, v
+    u_out = np.where(mask, np.nan, u)
+    v_out = np.where(mask, np.nan, v)
+    return u_out, v_out
+
 
 fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(15, 7), constrained_layout=True)
 
-# Build cell-edge coordinates for pcolormesh (one more edge than centres).
-# Centres are at i*dx for i=0..N-1; edges go at -0.5*dx + i*dx for i=0..N (i.e. straddling each centre).
-def edges_from_axis(centres):
-    n = len(centres)
-    edges = np.empty(n + 1)
-    edges[1:-1] = 0.5 * (centres[:-1] + centres[1:])
-    edges[0]    = centres[0]  - 0.5 * (centres[1] - centres[0])
-    edges[-1]   = centres[-1] + 0.5 * (centres[-1] - centres[-2])
-    return edges
-
-x_edges = edges_from_axis(x_axis)
-y_edges = edges_from_axis(y_axis)
-z_edges = edges_from_axis(z_axis)
+# Coordinate flat arrays for scatter (constant across frames)
+Y_yz, Z_yz = np.meshgrid(y_axis, z_axis, indexing="ij")    # (Ny, Nz)
+X_xz, Z_xz = np.meshgrid(x_axis, z_axis, indexing="ij")    # (Nx, Nz)
+yz_y_flat = Y_yz.ravel(); yz_z_flat = Z_yz.ravel()
+xz_x_flat = X_xz.ravel(); xz_z_flat = Z_xz.ravel()
 
 
 def setup_axes_plot1(ax_yz, ax_xz):
     ax_yz.set_xlim(0, Ly); ax_yz.set_ylim(0, Lz); ax_yz.set_aspect("equal")
     ax_yz.set_xlabel("y [m]"); ax_yz.set_ylabel("z [m]")
+    ax_yz.set_facecolor("#f4f4f4")     # neutral grey so gaps between particles read as 'between'
     ax_xz.set_xlim(0, Lx); ax_xz.set_ylim(0, Lz); ax_xz.set_aspect("equal")
     ax_xz.set_xlabel("x [m]"); ax_xz.set_ylabel("z [m]")
+    ax_xz.set_facecolor("#f4f4f4")
+
+
+def marker_size_for(ax, dx_axis, fill_fraction=0.65):
+    """Compute scatter `s` (points^2) such that a square marker spans
+    fill_fraction * dx_axis data units along the x-axis.
+
+    fill_fraction < 1.0 leaves visible gaps between markers so the plot
+    reads as a scatter of discrete particles rather than a tiled fill.
+    """
+    bbox = ax.get_window_extent()   # pixels in display coords
+    xlim = ax.get_xlim()
+    pixels_per_unit = bbox.width / (xlim[1] - xlim[0])
+    pt_per_pixel = 72.0 / ax.figure.dpi
+    diameter_pt = pixels_per_unit * pt_per_pixel * dx_axis * fill_fraction
+    return diameter_pt ** 2
+
+
+# Force one draw to give the axes a real window extent so marker_size_for works.
+setup_axes_plot1(ax1a, ax1b)
+fig1.canvas.draw()
+size_yz = marker_size_for(ax1a, dy)    # YZ slice: marker spans dy in y-direction
+size_xz = marker_size_for(ax1b, dx)    # XZ slice: marker spans dx in x-direction
 
 
 def render_plot1_frame(snap):
@@ -249,19 +293,21 @@ def render_plot1_frame(snap):
 
     # ── YZ slice at x = x_axis[ix_src] ──
     Sw_yz = slice_yz(Sw3, ix_src); Sn_yz = slice_yz(Sn3, ix_src); Sa_yz = slice_yz(Sa3, ix_src)
-    rgb_yz = rgb_from(Sw_yz, Sn_yz, Sa_yz)   # (Ny, Nz, 3)
-    # pcolormesh expects (Nz, Ny, 3) when called as pcolormesh(y_edges, z_edges, ...)
-    ax1a.pcolormesh(y_edges, z_edges, np.transpose(rgb_yz, (1, 0, 2)), shading="flat")
+    rgb_yz = rgb_from(Sw_yz, Sn_yz, Sa_yz).reshape(-1, 3)
+    ax1a.scatter(yz_y_flat, yz_z_flat, c=rgb_yz, marker="o",
+                 s=size_yz, edgecolors="none", alpha=args.alpha)
 
     qy_yz_w = slice_yz(qy3, ix_src); qz_yz_w = slice_yz(qz3, ix_src)
-    if np.max(np.abs(qy_yz_w) + np.abs(qz_yz_w)) > 1e-25:
-        ax1a.streamplot(y_axis, z_axis, qy_yz_w.T, qz_yz_w.T,
+    qy_yz_w_m, qz_yz_w_m = mask_low_speed(qy_yz_w, qz_yz_w, args.stream_threshold)
+    if np.nanmax(np.abs(qy_yz_w_m) + np.abs(qz_yz_w_m)) > 1e-25:
+        ax1a.streamplot(y_axis, z_axis, qy_yz_w_m.T, qz_yz_w_m.T,
                          color="blue", linewidth=0.9, density=1.2,
                          arrowsize=1.0, arrowstyle="->")
     if qyn3 is not None:
         qy_yz_n = slice_yz(qyn3, ix_src); qz_yz_n = slice_yz(qzn3, ix_src)
-        if np.max(np.abs(qy_yz_n) + np.abs(qz_yz_n)) > 1e-25:
-            ax1a.streamplot(y_axis, z_axis, qy_yz_n.T, qz_yz_n.T,
+        qy_yz_n_m, qz_yz_n_m = mask_low_speed(qy_yz_n, qz_yz_n, args.stream_threshold)
+        if np.nanmax(np.abs(qy_yz_n_m) + np.abs(qz_yz_n_m)) > 1e-25:
+            ax1a.streamplot(y_axis, z_axis, qy_yz_n_m.T, qz_yz_n_m.T,
                              color="red", linewidth=0.9, density=1.2,
                              arrowsize=1.0, arrowstyle="->")
 
@@ -271,18 +317,21 @@ def render_plot1_frame(snap):
 
     # ── XZ slice at y = y_axis[iy_src] ──
     Sw_xz = slice_xz(Sw3, iy_src); Sn_xz = slice_xz(Sn3, iy_src); Sa_xz = slice_xz(Sa3, iy_src)
-    rgb_xz = rgb_from(Sw_xz, Sn_xz, Sa_xz)   # (Nx, Nz, 3)
-    ax1b.pcolormesh(x_edges, z_edges, np.transpose(rgb_xz, (1, 0, 2)), shading="flat")
+    rgb_xz = rgb_from(Sw_xz, Sn_xz, Sa_xz).reshape(-1, 3)
+    ax1b.scatter(xz_x_flat, xz_z_flat, c=rgb_xz, marker="o",
+                 s=size_xz, edgecolors="none", alpha=args.alpha)
 
     qx_xz_w = slice_xz(qx3, iy_src); qz_xz_w = slice_xz(qz3, iy_src)
-    if np.max(np.abs(qx_xz_w) + np.abs(qz_xz_w)) > 1e-25:
-        ax1b.streamplot(x_axis, z_axis, qx_xz_w.T, qz_xz_w.T,
+    qx_xz_w_m, qz_xz_w_m = mask_low_speed(qx_xz_w, qz_xz_w, args.stream_threshold)
+    if np.nanmax(np.abs(qx_xz_w_m) + np.abs(qz_xz_w_m)) > 1e-25:
+        ax1b.streamplot(x_axis, z_axis, qx_xz_w_m.T, qz_xz_w_m.T,
                          color="blue", linewidth=0.9, density=1.5,
                          arrowsize=1.0, arrowstyle="->")
     if qxn3 is not None:
         qx_xz_n = slice_xz(qxn3, iy_src); qz_xz_n = slice_xz(qzn3, iy_src)
-        if np.max(np.abs(qx_xz_n) + np.abs(qz_xz_n)) > 1e-25:
-            ax1b.streamplot(x_axis, z_axis, qx_xz_n.T, qz_xz_n.T,
+        qx_xz_n_m, qz_xz_n_m = mask_low_speed(qx_xz_n, qz_xz_n, args.stream_threshold)
+        if np.nanmax(np.abs(qx_xz_n_m) + np.abs(qz_xz_n_m)) > 1e-25:
+            ax1b.streamplot(x_axis, z_axis, qx_xz_n_m.T, qz_xz_n_m.T,
                              color="red", linewidth=0.9, density=1.5,
                              arrowsize=1.0, arrowstyle="->")
 
