@@ -52,7 +52,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "../data_sph/"
+OUTPUT_DIR = "/Users/michele/SPH/data_sph/3D/"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -117,9 +117,9 @@ print(f"alpha_aw = {g_a:.4f}  alpha_nw = {alpha_nw:.4f}  1/m")
 # ======================================================================
 Lx, Ly, Lz = 10.0, 10.0, 10.0
 
-Nx = 51       # particles in x  (horizontal flow direction)
-Ny = 51       # particles in y  (horizontal, perpendicular to flow)
-Nz = 51       # particles in z  (vertical, gravity direction)
+Nx = 31       # particles in x  (horizontal flow direction)
+Ny = 31       # particles in y  (horizontal, perpendicular to flow)
+Nz = 31       # particles in z  (vertical, gravity direction)
 dx = Lx / (Nx - 1)
 dy = Ly / (Ny - 1)
 dz = Lz / (Nz - 1)
@@ -1088,8 +1088,12 @@ hdf5_path = os.path.join(OUTPUT_DIR, "sph_napl_snapshots.h5")
 
 SNAP_DIR = os.path.join(OUTPUT_DIR, "snapshots")
 
-def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt, qx, qy, qz):
-    """Save snapshot — HDF5 if available, else individual NPZ files."""
+def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
+                  qx, qy, qz, qxn, qyn, qzn):
+    """Save snapshot — HDF5 if available, else individual NPZ files.
+    qx,qy,qz   : water Darcy velocity components
+    qxn,qyn,qzn: NAPL  Darcy velocity components
+    """
     Sw = compute_Sw_3ph(h_field, Sn_field)
 
     if HAS_H5:
@@ -1125,6 +1129,9 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt, qx, qy, qz):
             grp.create_dataset("qx",   data=qx)
             grp.create_dataset("qy",   data=qy)
             grp.create_dataset("qz",   data=qz)
+            grp.create_dataset("qxn", data=qxn)
+            grp.create_dataset("qyn", data=qyn)
+            grp.create_dataset("qzn", data=qzn)
             grp.create_dataset("ptype", data=ptype)
             grp.create_dataset("is_source", data=is_source.astype(np.int8))
     else:
@@ -1138,7 +1145,9 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt, qx, qy, qz):
             Sn=Sn_field, Sw=Sw,
             kw=compute_kw_3ph(h_field, Sn_field),
             kn=compute_kn_field(h_field, Sn_field),
-            dhdt=dhdt, dSndt=dSndt, qx=qx, qy=qy, qz=qz,
+            dhdt=dhdt, dSndt=dSndt,
+            qx=qx, qy=qy, qz=qz,
+            qxn=qxn, qyn=qyn, qzn=qzn,
             ptype=ptype, is_source=is_source.astype(np.int8))
 
 # NOTE: snapshot file is NOT deleted on restart — new groups are appended
@@ -1272,10 +1281,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 2000          # adjust as needed
-snapshot_every = 200
-print_every    = 100
-ckpt_every     = 500
+N_steps_max    = 50000          # adjust as needed
+snapshot_every = 1000
+print_every    = 1000
+ckpt_every     = 10*snapshot_every
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
@@ -1409,7 +1418,9 @@ for step in range(start_step, N_steps_max + 1):
     # HDF5 snapshot
     if step % snapshot_every == 0 or step == start_step:
         qx_s, qy_s, qz_s = compute_darcy_velocity(h_w, S_n)
-        save_snapshot(hdf5_path, step, t_phys, h_w, S_n, dhdt, dSndt, qx_s, qy_s, qz_s)
+        qxn_s, qyn_s, qzn_s = compute_darcy_velocity_napl(h_w, S_n)
+        save_snapshot(hdf5_path, step, t_phys, h_w, S_n, dhdt, dSndt,
+                      qx_s, qy_s, qz_s, qxn_s, qyn_s, qzn_s)
 
     # Sn snapshot for animation
     if step % Sn_snap_every == 0 or step == start_step:
@@ -1441,10 +1452,12 @@ if ran_steps:
 
 # Final velocities
 print("Computing final Darcy velocity ...", flush=True)
-qx_final, qy_final, qz_final = compute_darcy_velocity(h_w, S_n)
+qx_final,  qy_final,  qz_final  = compute_darcy_velocity(h_w, S_n)
+qxn_final, qyn_final, qzn_final = compute_darcy_velocity_napl(h_w, S_n)
 dhdt_f = compute_dhdt(h_w, S_n)
 dSndt_f = compute_dSndt(h_w, S_n)
-save_snapshot(hdf5_path, step, t_phys, h_w, S_n, dhdt_f, dSndt_f, qx_final, qy_final, qz_final)
+save_snapshot(hdf5_path, step, t_phys, h_w, S_n, dhdt_f, dSndt_f,
+               qx_final, qy_final, qz_final, qxn_final, qyn_final, qzn_final)
 print("  done.")
 
 
