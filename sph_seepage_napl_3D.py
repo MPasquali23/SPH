@@ -39,6 +39,98 @@ import numpy as np
 import os
 import sys
 import time as wall_time
+import argparse
+
+
+# ======================================================================
+# COMMAND-LINE ARGUMENTS
+# ======================================================================
+# All physical/numerical parameters can be overridden from the command line.
+# Defaults match the original hard-coded values.
+
+_parser = argparse.ArgumentParser(
+    description="3D SPH three-phase seepage with NAPL source",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+# --- Grid & domain ---
+_g_grid = _parser.add_argument_group("Grid & domain")
+_g_grid.add_argument("--nx", type=int, default=51, help="Particles in x")
+_g_grid.add_argument("--ny", type=int, default=51, help="Particles in y")
+_g_grid.add_argument("--nz", type=int, default=51, help="Particles in z (gravity)")
+_g_grid.add_argument("--lx", type=float, default=10.0, help="Domain length x [m]")
+_g_grid.add_argument("--ly", type=float, default=10.0, help="Domain length y [m]")
+_g_grid.add_argument("--lz", type=float, default=10.0, help="Domain length z [m]")
+
+# --- Boundary conditions ---
+_g_bc = _parser.add_argument_group("Water Dirichlet BCs")
+_g_bc.add_argument("--h-left",  type=float, default=8.0, help="Hydraulic head H at x=0 [m]")
+_g_bc.add_argument("--h-right", type=float, default=6.0, help="Hydraulic head H at x=Lx [m]")
+
+# --- NAPL source ---
+_g_src = _parser.add_argument_group("NAPL source (cuboid)")
+_g_src.add_argument("--src-x0", type=float, default=4.5, help="Source x lower bound [m]")
+_g_src.add_argument("--src-x1", type=float, default=5.5, help="Source x upper bound [m]")
+_g_src.add_argument("--src-y0", type=float, default=4.5, help="Source y lower bound [m]")
+_g_src.add_argument("--src-y1", type=float, default=5.5, help="Source y upper bound [m]")
+_g_src.add_argument("--src-z0", type=float, default=8.5, help="Source z lower bound [m]")
+_g_src.add_argument("--src-z1", type=float, default=9.5, help="Source z upper bound [m]")
+_g_src.add_argument("--sn-source", type=float, default=0.80,
+                     help="NAPL saturation at source (held fixed)")
+
+# --- Time integration ---
+_g_time = _parser.add_argument_group("Time integration")
+_g_time.add_argument("--n-steps", type=int, default=80000,
+                      help="Maximum number of time steps")
+_g_time.add_argument("--cfl", type=float, default=0.25, help="CFL factor for stable dt")
+
+# --- I/O ---
+_g_io = _parser.add_argument_group("I/O cadence")
+_g_io.add_argument("--snapshot-every", type=int, default=500,
+                    help="HDF5 snapshot every N steps")
+_g_io.add_argument("--ckpt-every", type=int, default=15000,
+                    help="Checkpoint every N steps")
+_g_io.add_argument("--print-every", type=int, default=5000,
+                    help="Console log every N steps")
+_g_io.add_argument("--sn-snap-every", type=int, default=0,
+                    help="In-memory Sn snapshot every N steps for animation. "
+                         "0 = auto (n_steps/40)")
+
+# --- Output paths ---
+_g_path = _parser.add_argument_group("Output paths")
+_g_path.add_argument("--outdir", type=str, default=".",
+                      help="Directory for HDF5/NPZ snapshots, checkpoints, figures")
+_g_path.add_argument("--snapshot-file", type=str, default="sph_napl_snapshots.h5",
+                      help="HDF5 snapshot filename (relative to --outdir)")
+
+args = _parser.parse_args()
+
+# Validation
+if args.src_x0 >= args.src_x1 or args.src_y0 >= args.src_y1 or args.src_z0 >= args.src_z1:
+    sys.exit("ERROR: source bbox bounds must satisfy X0<X1, Y0<Y1, Z0<Z1")
+if not (0.0 < args.sn_source <= 1.0):
+    sys.exit("ERROR: --sn-source must be in (0, 1]")
+if args.nx < 3 or args.ny < 3 or args.nz < 3:
+    sys.exit("ERROR: grid sizes must be at least 3 (need interior particles)")
+if args.lx <= 0 or args.ly <= 0 or args.lz <= 0:
+    sys.exit("ERROR: domain dimensions must be positive")
+if not (args.src_x1 <= args.lx and args.src_y1 <= args.ly and args.src_z1 <= args.lz):
+    sys.exit("ERROR: source bbox extends outside domain")
+if args.src_x0 < 0 or args.src_y0 < 0 or args.src_z0 < 0:
+    sys.exit("ERROR: source bbox cannot have negative bounds")
+
+print(f"\n{'='*70}")
+print(f"  3D SPH Three-Phase Seepage — configuration")
+print(f"{'='*70}")
+print(f"  Grid           : {args.nx} x {args.ny} x {args.nz} = {args.nx*args.ny*args.nz} particles")
+print(f"  Domain         : {args.lx} x {args.ly} x {args.lz} m")
+print(f"  Water BCs      : H_left = {args.h_left} m,  H_right = {args.h_right} m")
+print(f"  NAPL source    : x[{args.src_x0},{args.src_x1}]  "
+      f"y[{args.src_y0},{args.src_y1}]  z[{args.src_z0},{args.src_z1}]  Sn={args.sn_source}")
+print(f"  Time           : up to {args.n_steps} steps, CFL={args.cfl}")
+print(f"  I/O            : snapshot every {args.snapshot_every},  "
+      f"ckpt every {args.ckpt_every},  print every {args.print_every}")
+print(f"  Output         : {os.path.abspath(args.outdir)}")
+print(f"{'='*70}")
 
 try:
     import numba
@@ -52,7 +144,7 @@ except ImportError:
 # ======================================================================
 # 0.  OUTPUT DIRECTORY
 # ======================================================================
-OUTPUT_DIR = "/Users/michele/SPH/data_sph/3D/"
+OUTPUT_DIR = args.outdir
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ======================================================================
@@ -115,11 +207,11 @@ print(f"alpha_aw = {g_a:.4f}  alpha_nw = {alpha_nw:.4f}  1/m")
 # ======================================================================
 # 2.  DOMAIN  &  SPH DISCRETISATION   (3D — z is the gravity axis)
 # ======================================================================
-Lx, Ly, Lz = 10.0, 10.0, 10.0
+Lx, Ly, Lz = args.lx, args.ly, args.lz
 
-Nx = 31       # particles in x  (horizontal flow direction)
-Ny = 31       # particles in y  (horizontal, perpendicular to flow)
-Nz = 31       # particles in z  (vertical, gravity direction)
+Nx = args.nx       # particles in x  (horizontal flow direction)
+Ny = args.ny       # particles in y  (horizontal, perpendicular to flow)
+Nz = args.nz       # particles in z  (vertical, gravity direction)
 dx = Lx / (Nx - 1)
 dy = Ly / (Ny - 1)
 dz = Lz / (Nz - 1)
@@ -589,8 +681,8 @@ def compute_Hn_field(h_w, S_n):
 # ptype:  0 = interior, 1 = left, 2 = right,
 #         3 = bottom, 4 = top, 5 = front, 6 = back
 
-H_u = 8.0
-H_d = 6.0
+H_u = args.h_left
+H_d = args.h_right
 
 ptype = np.zeros(N_part, dtype=int)
 tol_bc = 0.5 * dx
@@ -628,10 +720,10 @@ h_init = h_w.copy()
 
 # -- NAPL source region (3D cube) --
 # 1 m x 1 m x 1 m cube, centred horizontally in x AND y, near top in z
-SRC_X0, SRC_X1 = 4.5, 5.5
-SRC_Y0, SRC_Y1 = 4.5, 5.5
-SRC_Z0, SRC_Z1 = 8.5, 9.5
-SN_SOURCE       = 0.80       # fixed NAPL saturation at source
+SRC_X0, SRC_X1 = args.src_x0, args.src_x1
+SRC_Y0, SRC_Y1 = args.src_y0, args.src_y1
+SRC_Z0, SRC_Z1 = args.src_z0, args.src_z1
+SN_SOURCE      = args.sn_source       # fixed NAPL saturation at source
 
 is_source = ((xp >= SRC_X0) & (xp <= SRC_X1) &
              (yp >= SRC_Y0) & (yp <= SRC_Y1) &
@@ -1062,7 +1154,7 @@ def compute_darcy_velocity_napl(h_field, Sn_field):
 # ======================================================================
 # 11.  TIME STEP   [Paper Eq. 66 / Appendix A.17]
 # ======================================================================
-CFL = 0.25
+CFL = args.cfl
 
 def stable_dt(h_field, Sn_field):
     Cs = compute_Cs(h_field)
@@ -1084,7 +1176,7 @@ except ImportError:
     HAS_H5 = False
     print("WARNING: h5py not available - HDF5 snapshots disabled.")
 
-hdf5_path = os.path.join(OUTPUT_DIR, "sph_napl_snapshots.h5")
+hdf5_path = os.path.join(OUTPUT_DIR, args.snapshot_file)
 
 SNAP_DIR = os.path.join(OUTPUT_DIR, "snapshots")
 
@@ -1129,9 +1221,9 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
             grp.create_dataset("qx",   data=qx)
             grp.create_dataset("qy",   data=qy)
             grp.create_dataset("qz",   data=qz)
-            grp.create_dataset("qxn", data=qxn)
-            grp.create_dataset("qyn", data=qyn)
-            grp.create_dataset("qzn", data=qzn)
+            grp.create_dataset("qxn",  data=qxn)
+            grp.create_dataset("qyn",  data=qyn)
+            grp.create_dataset("qzn",  data=qzn)
             grp.create_dataset("ptype", data=ptype)
             grp.create_dataset("is_source", data=is_source.astype(np.int8))
     else:
@@ -1173,6 +1265,7 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
         # Fallback: NPZ if h5py unavailable
         path = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.npz")
         np.savez_compressed(path, step=step, t_phys=t, h_w=hw, S_n=Sn,
+            Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
             time_log=np.array(time_log), l2_log=np.array(l2_log),
             l2n_log=np.array(l2n_log), Sn_max_log=np.array(Sn_max_log),
             napl_mass_log=np.array(napl_mass_log),
@@ -1187,12 +1280,19 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
         f.attrs["t_phys"]  = t
         f.attrs["Nx"]      = Nx
         f.attrs["Ny"]      = Ny
+        f.attrs["Nz"]      = Nz
         f.attrs["Lx"]      = Lx
         f.attrs["Ly"]      = Ly
+        f.attrs["Lz"]      = Lz
         f.attrs["k_sat"]   = k_sat
         f.attrs["k_sat_n"] = k_sat_n
         f.attrs["H_u"]     = H_u
         f.attrs["H_d"]     = H_d
+        # Source bbox (for restart compatibility check)
+        f.attrs["src_x0"]  = SRC_X0; f.attrs["src_x1"] = SRC_X1
+        f.attrs["src_y0"]  = SRC_Y0; f.attrs["src_y1"] = SRC_Y1
+        f.attrs["src_z0"]  = SRC_Z0; f.attrs["src_z1"] = SRC_Z1
+        f.attrs["sn_source"] = SN_SOURCE
 
         # Field arrays (compressed)
         ckw = dict(compression="gzip", compression_opts=4)
@@ -1249,6 +1349,26 @@ def load_latest_checkpoint():
 
     if fmt == "h5" and HAS_H5:
         with h5py.File(path, "r") as f:
+            # Geometry compatibility check
+            ck_Nx = int(f.attrs.get("Nx", -1))
+            ck_Ny = int(f.attrs.get("Ny", -1))
+            ck_Nz = int(f.attrs.get("Nz", -1))
+            ck_Lx = float(f.attrs.get("Lx", -1.0))
+            ck_Ly = float(f.attrs.get("Ly", -1.0))
+            ck_Lz = float(f.attrs.get("Lz", -1.0))
+            mismatches = []
+            if ck_Nx != Nx: mismatches.append(f"Nx (ckpt={ck_Nx} vs run={Nx})")
+            if ck_Ny != Ny: mismatches.append(f"Ny (ckpt={ck_Ny} vs run={Ny})")
+            if ck_Nz != Nz: mismatches.append(f"Nz (ckpt={ck_Nz} vs run={Nz})")
+            if abs(ck_Lx - Lx) > 1e-9: mismatches.append(f"Lx (ckpt={ck_Lx} vs run={Lx})")
+            if abs(ck_Ly - Ly) > 1e-9: mismatches.append(f"Ly (ckpt={ck_Ly} vs run={Ly})")
+            if abs(ck_Lz - Lz) > 1e-9: mismatches.append(f"Lz (ckpt={ck_Lz} vs run={Lz})")
+            if mismatches:
+                sys.exit(f"ERROR: checkpoint geometry mismatch ({path}):\n  "
+                         + "\n  ".join(mismatches)
+                         + "\n  Either match these settings on the command line, "
+                         + "delete the checkpoint, or use a different --outdir.")
+
             d = {
                 "step":    int(f.attrs["step"]),
                 "t_phys":  float(f.attrs["t_phys"]),
@@ -1270,6 +1390,24 @@ def load_latest_checkpoint():
         d = {k: d_raw[k] for k in d_raw.files}
         d["step"]   = int(d["step"])
         d["t_phys"] = float(d["t_phys"])
+
+        # Geometry compatibility check (only if checkpoint has geometry attrs)
+        if "Nx" in d_raw.files:
+            ck_Nx = int(d_raw["Nx"]); ck_Ny = int(d_raw["Ny"]); ck_Nz = int(d_raw["Nz"])
+            ck_Lx = float(d_raw["Lx"]); ck_Ly = float(d_raw["Ly"]); ck_Lz = float(d_raw["Lz"])
+            mismatches = []
+            if ck_Nx != Nx: mismatches.append(f"Nx (ckpt={ck_Nx} vs run={Nx})")
+            if ck_Ny != Ny: mismatches.append(f"Ny (ckpt={ck_Ny} vs run={Ny})")
+            if ck_Nz != Nz: mismatches.append(f"Nz (ckpt={ck_Nz} vs run={Nz})")
+            if abs(ck_Lx - Lx) > 1e-9: mismatches.append(f"Lx (ckpt={ck_Lx} vs run={Lx})")
+            if abs(ck_Ly - Ly) > 1e-9: mismatches.append(f"Ly (ckpt={ck_Ly} vs run={Ly})")
+            if abs(ck_Lz - Lz) > 1e-9: mismatches.append(f"Lz (ckpt={ck_Lz} vs run={Lz})")
+            if mismatches:
+                sys.exit(f"ERROR: checkpoint geometry mismatch ({path}):\n  "
+                         + "\n  ".join(mismatches)
+                         + "\n  Either match these settings on the command line, "
+                         + "delete the checkpoint, or use a different --outdir.")
+
         print(f"  Restarting from NPZ checkpoint: {path}")
         print(f"    step = {d['step']},  t = {d['t_phys']:.4e} s")
         return d
@@ -1281,10 +1419,10 @@ def load_latest_checkpoint():
 # 13.  MAIN SIMULATION LOOP
 # ======================================================================
 
-N_steps_max    = 50000          # adjust as needed
-snapshot_every = 1000
-print_every    = 1000
-ckpt_every     = 10*snapshot_every
+N_steps_max    = args.n_steps
+snapshot_every = args.snapshot_every
+print_every    = args.print_every
+ckpt_every     = args.ckpt_every
 ss_tol         = 1e-14
 
 # --- Attempt restart from checkpoint ---
@@ -1359,12 +1497,14 @@ else:
 
 # History of Sn snapshots (for animation / evolution panel)
 Sn_history = []       # list of (step, t, Sn_copy)
-Sn_snap_every = max(1, N_steps_max // 40)   # ~40 frames for animation
+Sn_snap_every = (args.sn_snap_every
+                 if args.sn_snap_every > 0
+                 else max(1, N_steps_max // 40))   # ~40 frames for animation
 
 print(f"\n{'='*70}")
 print(f"  THREE-PHASE SPH: Water + LNAPL + Air")
 print(f"  Steps [{start_step}, {N_steps_max}],  NAPL source at "
-      f"[{SRC_X0},{SRC_X1}] x [{SRC_Y0},{SRC_Y1}]")
+      f"[{SRC_X0},{SRC_X1}] x [{SRC_Y0},{SRC_Y1}] x [{SRC_Z0},{SRC_Z1}]")
 print(f"{'='*70}")
 t_wall0 = wall_time.time()
 
@@ -1417,10 +1557,10 @@ for step in range(start_step, N_steps_max + 1):
 
     # HDF5 snapshot
     if step % snapshot_every == 0 or step == start_step:
-        qx_s, qy_s, qz_s = compute_darcy_velocity(h_w, S_n)
+        qx_s,  qy_s,  qz_s  = compute_darcy_velocity(h_w, S_n)
         qxn_s, qyn_s, qzn_s = compute_darcy_velocity_napl(h_w, S_n)
         save_snapshot(hdf5_path, step, t_phys, h_w, S_n, dhdt, dSndt,
-                      qx_s, qy_s, qz_s, qxn_s, qyn_s, qzn_s)
+                       qx_s, qy_s, qz_s, qxn_s, qyn_s, qzn_s)
 
     # Sn snapshot for animation
     if step % Sn_snap_every == 0 or step == start_step:
