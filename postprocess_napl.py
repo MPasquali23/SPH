@@ -36,6 +36,15 @@ try:
 except ImportError:
     HAS_H5 = False
 
+# Exceptions that can be raised by np.load() and array access on a
+# corrupted NPZ file. zipfile.BadZipFile is NOT an OSError on Python
+# 3.x, so we have to enumerate it explicitly.
+import zipfile
+_NPZ_ERRORS = (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile)
+# Same idea for HDF5 — h5py raises OSError for I/O issues, but specific
+# build versions can raise RuntimeError or h5py-specific exceptions.
+_H5_ERRORS = (OSError, KeyError, ValueError, RuntimeError)
+
 
 # ======================================================================
 # CLI
@@ -71,52 +80,259 @@ if HAS_H5 and not os.path.exists(args.input):
 # ======================================================================
 # LOAD SNAPSHOTS  (HDF5 if available, else NPZ directory)
 # ======================================================================
+def _validate_h5_snapshot(group, expected_npart):
+    """Return (ok, reason) for whether an HDF5 snapshot group is fully readable.
+
+    Catches the common rsync / partial-write failure modes:
+      - missing required attrs or datasets
+      - truncated dataset (wrong shape)
+      - I/O errors when actually fetching the data
+    Cheap: only reads attrs and shapes, not full data arrays.
+    """
+    required_attrs = ("step", "time_s", "Nx", "Ny", "Nz", "Lx", "Ly", "Lz")
+    required_dsets = ("x", "y", "z", "h", "Sn", "Sw", "qx", "qy", "qz", "is_source")
+    try:
+        for a in required_attrs:
+            if a not in group.attrs:
+                return False, f"missing attr '{a}'"
+            _ = group.attrs[a]   # also verifies it's actually readable
+        for d in required_dsets:
+            if d not in group:
+                return False, f"missing dataset '{d}'"
+            shp = group[d].shape
+            if expected_npart is not None and shp[0] != expected_npart:
+                return False, f"dataset '{d}' has shape {shp}, expected ({expected_npart},)"
+    except _H5_ERRORS as e:
+        return False, f"I/O error: {type(e).__name__}: {e}"
+    return True, None
+
+
 def load_from_hdf5(path):
     print(f"Reading {path} ...", flush=True)
+
+    # Step 1: try to open the file at all
+    try:
+        h5_file = h5py.File(path, "r")
+    except (OSError, IOError) as e:
+        raise RuntimeError(
+            f"Cannot open HDF5 file {path}: {e}\n"
+            f"  This typically means the file is incomplete or corrupted.\n"
+            f"  Try:\n"
+            f"    - Re-running rsync to ensure full transfer\n"
+            f"    - 'h5ls {path}' to inspect structure\n"
+            f"    - 'h5repack {path} {path}.repacked' to recover salvageable data"
+        ) from e
+
     snaps = []
-    with h5py.File(path, "r") as f:
-        groups = sorted([k for k in f.keys() if k.startswith("step_")])
+    skipped = []      # list of (group_name, reason)
+    meta = None
+
+    with h5_file as f:
+        # Step 2: list groups (cheap; usually works even if some groups are bad)
+        try:
+            groups = sorted([k for k in f.keys() if k.startswith("step_")])
+        except (OSError, RuntimeError) as e:
+            raise RuntimeError(f"Cannot list groups in {path}: {e}") from e
+
         if len(groups) == 0:
             raise RuntimeError(f"No step_* groups found in {path}")
-        groups = groups[::args.skip]
-        g0 = f[groups[0]]
-        meta = {k: g0.attrs[k] for k in ("Nx","Ny","Nz","Lx","Ly","Lz")}
-        meta["x"] = g0["x"][...]; meta["y"] = g0["y"][...]; meta["z"] = g0["z"][...]
-        meta["is_source"] = g0["is_source"][...].astype(bool)
-        meta["has_napl_q"] = ("qxn" in g0) and ("qyn" in g0) and ("qzn" in g0)
+
+        # Step 3: find the first VALID group to extract geometry metadata
         for k in groups:
-            g = f[k]
-            d = {"step": int(g.attrs["step"]), "time": float(g.attrs["time_s"]),
-                 "h": g["h"][...], "Sn": g["Sn"][...], "Sw": g["Sw"][...],
-                 "qx": g["qx"][...], "qy": g["qy"][...], "qz": g["qz"][...]}
-            if meta["has_napl_q"]:
-                d["qxn"] = g["qxn"][...]; d["qyn"] = g["qyn"][...]; d["qzn"] = g["qzn"][...]
-            snaps.append(d)
+            try:
+                g = f[k]
+                ok, reason = _validate_h5_snapshot(g, expected_npart=None)
+                if not ok:
+                    skipped.append((k, reason))
+                    continue
+                Nx_ = int(g.attrs["Nx"])
+                Ny_ = int(g.attrs["Ny"])
+                Nz_ = int(g.attrs["Nz"])
+                expected_npart = Nx_ * Ny_ * Nz_
+                meta = {
+                    "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
+                    "Lx": float(g.attrs["Lx"]),
+                    "Ly": float(g.attrs["Ly"]),
+                    "Lz": float(g.attrs["Lz"]),
+                    "x": g["x"][...], "y": g["y"][...], "z": g["z"][...],
+                    "is_source": g["is_source"][...].astype(bool),
+                    "has_napl_q": ("qxn" in g) and ("qyn" in g) and ("qzn" in g),
+                }
+                break
+            except _H5_ERRORS as e:
+                skipped.append((k, f"metadata read failed: {type(e).__name__}: {e}"))
+                continue
+
+        if meta is None:
+            raise RuntimeError(
+                f"All {len(groups)} snapshot groups in {path} are unreadable.\n"
+                f"  First failures: {skipped[:3]}"
+            )
+
+        expected_npart = meta["Nx"] * meta["Ny"] * meta["Nz"]
+        # Apply --skip subsampling
+        groups_subset = groups[::args.skip]
+
+        # Snapshots that already failed metadata search are skipped
+        already_failed = {k for k, _ in skipped}
+
+        # Step 4: read each snapshot, skipping bad ones
+        for k in groups_subset:
+            if k in already_failed:
+                continue
+            try:
+                g = f[k]
+                ok, reason = _validate_h5_snapshot(g, expected_npart)
+                if not ok:
+                    skipped.append((k, reason))
+                    continue
+
+                # Now fetch the data. This is where I/O errors on truncated
+                # datasets actually trigger. Catch and skip.
+                d = {"step": int(g.attrs["step"]),
+                     "time": float(g.attrs["time_s"]),
+                     "h":  g["h"][...],  "Sn": g["Sn"][...], "Sw": g["Sw"][...],
+                     "qx": g["qx"][...], "qy": g["qy"][...], "qz": g["qz"][...]}
+                if meta["has_napl_q"]:
+                    # NAPL velocity may be missing only on this snapshot
+                    if "qxn" in g and "qyn" in g and "qzn" in g:
+                        d["qxn"] = g["qxn"][...]
+                        d["qyn"] = g["qyn"][...]
+                        d["qzn"] = g["qzn"][...]
+                snaps.append(d)
+            except _H5_ERRORS as e:
+                skipped.append((k, f"read failed: {type(e).__name__}: {e}"))
+                continue
+
+    # Report skipped snapshots
+    if skipped:
+        print(f"  WARNING: skipped {len(skipped)} unreadable snapshot(s):")
+        for k, reason in skipped[:5]:
+            print(f"    - {k}: {reason}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped) - 5} more")
+        print(f"  Likely cause: incomplete rsync transfer, partial write, "
+              f"or file corruption.")
+
+    if len(snaps) == 0:
+        raise RuntimeError(
+            f"No usable snapshots in {path} after skipping {len(skipped)} bad ones."
+        )
+
     return meta, snaps
 
 
+def _validate_npz_keys(loader, expected_npart):
+    """Return (ok, reason) for whether an NPZ snapshot has all required keys
+    with correct shapes. Doesn't load full data arrays."""
+    required = ("step", "time_s", "Nx", "Ny", "Nz", "Lx", "Ly", "Lz",
+                "x", "y", "z", "h", "Sn", "Sw", "qx", "qy", "qz", "is_source")
+    try:
+        for k in required:
+            if k not in loader.files:
+                return False, f"missing key '{k}'"
+        if expected_npart is not None:
+            for k in ("h", "Sn", "Sw", "qx", "qy", "qz"):
+                # Reading shape requires accessing the array, but NumPy lazy-
+                # loads from NPZ, so this is cheap.
+                shp = loader[k].shape
+                if shp[0] != expected_npart:
+                    return False, f"key '{k}' has shape {shp}, expected ({expected_npart},)"
+    except _NPZ_ERRORS as e:
+        return False, f"I/O error: {type(e).__name__}: {e}"
+    return True, None
+
+
 def load_from_npz(snap_dir):
-    """Read NPZ snapshots in <snap_dir>/step_*.npz ."""
+    """Read NPZ snapshots in <snap_dir>/step_*.npz, skipping corrupt files."""
     print(f"Reading NPZ snapshots from {snap_dir}/ ...", flush=True)
-    files = sorted([f for f in os.listdir(snap_dir) if f.startswith("step_") and f.endswith(".npz")])
+    try:
+        files = sorted([fn for fn in os.listdir(snap_dir)
+                         if fn.startswith("step_") and fn.endswith(".npz")])
+    except (OSError, FileNotFoundError) as e:
+        raise RuntimeError(f"Cannot list snapshots in {snap_dir}: {e}") from e
+
     if not files:
         raise RuntimeError(f"No step_*.npz files in {snap_dir}/")
-    files = files[::args.skip]
-    snaps = []
-    f0 = np.load(os.path.join(snap_dir, files[0]))
-    meta = {"Nx": int(f0["Nx"]), "Ny": int(f0["Ny"]), "Nz": int(f0["Nz"]),
-            "Lx": float(f0["Lx"]), "Ly": float(f0["Ly"]), "Lz": float(f0["Lz"]),
-            "x": f0["x"], "y": f0["y"], "z": f0["z"],
-            "is_source": f0["is_source"].astype(bool),
-            "has_napl_q": all(k in f0.files for k in ("qxn","qyn","qzn"))}
+
+    skipped = []
+    meta = None
+
+    # Find first valid file for metadata
     for fname in files:
-        f = np.load(os.path.join(snap_dir, fname))
-        d = {"step": int(f["step"]), "time": float(f["time_s"]),
-             "h": f["h"], "Sn": f["Sn"], "Sw": f["Sw"],
-             "qx": f["qx"], "qy": f["qy"], "qz": f["qz"]}
-        if meta["has_napl_q"]:
-            d["qxn"] = f["qxn"]; d["qyn"] = f["qyn"]; d["qzn"] = f["qzn"]
-        snaps.append(d)
+        path = os.path.join(snap_dir, fname)
+        try:
+            f0 = np.load(path)
+            ok, reason = _validate_npz_keys(f0, expected_npart=None)
+            if not ok:
+                skipped.append((fname, reason))
+                continue
+            Nx_ = int(f0["Nx"]); Ny_ = int(f0["Ny"]); Nz_ = int(f0["Nz"])
+            meta = {
+                "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
+                "Lx": float(f0["Lx"]), "Ly": float(f0["Ly"]), "Lz": float(f0["Lz"]),
+                "x": np.asarray(f0["x"]), "y": np.asarray(f0["y"]),
+                "z": np.asarray(f0["z"]),
+                "is_source": np.asarray(f0["is_source"]).astype(bool),
+                "has_napl_q": all(k in f0.files for k in ("qxn", "qyn", "qzn")),
+            }
+            break
+        except _NPZ_ERRORS as e:
+            skipped.append((fname, f"metadata read failed: {type(e).__name__}: {e}"))
+            continue
+
+    if meta is None:
+        raise RuntimeError(
+            f"All {len(files)} NPZ snapshot files in {snap_dir} are unreadable.\n"
+            f"  First failures: {skipped[:3]}"
+        )
+
+    expected_npart = meta["Nx"] * meta["Ny"] * meta["Nz"]
+    files_subset = files[::args.skip]
+    snaps = []
+
+    # Files that already failed metadata search are skipped
+    already_failed = {fname for fname, _ in skipped}
+
+    for fname in files_subset:
+        if fname in already_failed:
+            continue
+        path = os.path.join(snap_dir, fname)
+        try:
+            f = np.load(path)
+            ok, reason = _validate_npz_keys(f, expected_npart)
+            if not ok:
+                skipped.append((fname, reason))
+                continue
+            d = {"step": int(f["step"]), "time": float(f["time_s"]),
+                 "h":  np.asarray(f["h"]),
+                 "Sn": np.asarray(f["Sn"]),
+                 "Sw": np.asarray(f["Sw"]),
+                 "qx": np.asarray(f["qx"]),
+                 "qy": np.asarray(f["qy"]),
+                 "qz": np.asarray(f["qz"])}
+            if meta["has_napl_q"] and all(k in f.files for k in ("qxn", "qyn", "qzn")):
+                d["qxn"] = np.asarray(f["qxn"])
+                d["qyn"] = np.asarray(f["qyn"])
+                d["qzn"] = np.asarray(f["qzn"])
+            snaps.append(d)
+        except _NPZ_ERRORS as e:
+            skipped.append((fname, f"read failed: {type(e).__name__}: {e}"))
+            continue
+
+    if skipped:
+        print(f"  WARNING: skipped {len(skipped)} unreadable NPZ file(s):")
+        for fname, reason in skipped[:5]:
+            print(f"    - {fname}: {reason}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped) - 5} more")
+
+    if len(snaps) == 0:
+        raise RuntimeError(
+            f"No usable NPZ snapshots in {snap_dir} after skipping "
+            f"{len(skipped)} bad ones."
+        )
+
     return meta, snaps
 
 
