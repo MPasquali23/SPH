@@ -1657,7 +1657,7 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
     if HAS_H5:
         mode = "a" if os.path.exists(fname) else "w"
         with h5py.File(fname, mode) as f:
-            grp_name = f"step_{step:06d}"
+            grp_name = f"step_{step:012d}"
             if grp_name in f:
                 del f[grp_name]
             grp = f.create_group(grp_name)
@@ -1695,7 +1695,7 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
     else:
         # NPZ fallback: one file per snapshot in snapshots/ directory
         os.makedirs(SNAP_DIR, exist_ok=True)
-        path = os.path.join(SNAP_DIR, f"step_{step:06d}.npz")
+        path = os.path.join(SNAP_DIR, f"step_{step:012d}.npz")
         np.savez_compressed(path,
             step=step, time_s=t, Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
             k_sat=k_sat, H_u=H_u, H_d=H_d,
@@ -1729,7 +1729,7 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
     """Save full simulation state to an individual HDF5 checkpoint file."""
     if not HAS_H5:
         # Fallback: NPZ if h5py unavailable
-        path = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.npz")
+        path = os.path.join(CKPT_DIR, f"ckpt_{step:012d}.npz")
         np.savez_compressed(path, step=step, t_phys=t, h_w=hw, S_n=Sn,
             Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
             time_log=np.array(time_log), l2_log=np.array(l2_log),
@@ -1739,7 +1739,7 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
         print(f"    checkpoint saved (NPZ fallback): {path}")
         return
 
-    path = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.h5")
+    path = os.path.join(CKPT_DIR, f"ckpt_{step:012d}.h5")
     with h5py.File(path, "w") as f:
         # Scalar metadata as attributes on root
         f.attrs["step"]    = step
@@ -1783,20 +1783,23 @@ def load_latest_checkpoint():
     """
     import glob
 
-    # Scan for HDF5 checkpoints
-    h5_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.h5")))
-    # Scan for NPZ checkpoints
-    npz_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.npz")))
-
-    # Pick the latest across both formats
-    latest_h5  = h5_files[-1]  if h5_files  else None
-    latest_npz = npz_files[-1] if npz_files else None
-
-    # Extract step numbers to compare
+    # Helper to extract step number from a checkpoint path.
+    # Robust to any zero-padding width (legacy files mixed with current).
     def step_from_path(p):
         base = os.path.basename(p)       # ckpt_00001000.h5
         num  = base.split("_")[1].split(".")[0]  # 00001000
         return int(num)
+
+    # Scan for HDF5 checkpoints, sort numerically by step
+    h5_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.h5")),
+                       key=step_from_path)
+    # Scan for NPZ checkpoints
+    npz_files = sorted(glob.glob(os.path.join(CKPT_DIR, "ckpt_*.npz")),
+                        key=step_from_path)
+
+    # Pick the latest across both formats
+    latest_h5  = h5_files[-1]  if h5_files  else None
+    latest_npz = npz_files[-1] if npz_files else None
 
     # Determine which is more recent
     path = None

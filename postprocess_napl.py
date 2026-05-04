@@ -46,6 +46,21 @@ _NPZ_ERRORS = (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile)
 _H5_ERRORS = (OSError, KeyError, ValueError, RuntimeError)
 
 
+def _step_from_name(name):
+    """Extract the integer step from a group name 'step_NNNNNN' or filename
+    'step_NNNNNN.npz'.  Robust to any zero-padding width — needed because
+    long runs (>= 1e6 steps) overflow the original 6-digit width and mix
+    different widths in the same directory.
+    Returns -1 on parse failure (so the entry sorts to the front and can
+    be inspected separately).
+    """
+    try:
+        base = name.split(".")[0]               # strip extension if any
+        return int(base.split("_")[1])
+    except (ValueError, IndexError):
+        return -1
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -130,7 +145,8 @@ def load_from_hdf5(path):
     with h5_file as f:
         # Step 2: list groups (cheap; usually works even if some groups are bad)
         try:
-            groups = sorted([k for k in f.keys() if k.startswith("step_")])
+            groups = sorted([k for k in f.keys() if k.startswith("step_")],
+                             key=_step_from_name)
         except (OSError, RuntimeError) as e:
             raise RuntimeError(f"Cannot list groups in {path}: {e}") from e
 
@@ -248,7 +264,8 @@ def load_from_npz(snap_dir):
     print(f"Reading NPZ snapshots from {snap_dir}/ ...", flush=True)
     try:
         files = sorted([fn for fn in os.listdir(snap_dir)
-                         if fn.startswith("step_") and fn.endswith(".npz")])
+                         if fn.startswith("step_") and fn.endswith(".npz")],
+                        key=_step_from_name)
     except (OSError, FileNotFoundError) as e:
         raise RuntimeError(f"Cannot list snapshots in {snap_dir}: {e}") from e
 
