@@ -78,7 +78,7 @@ _g_src.add_argument("--sn-source", type=float, default=0.80,
 _g_time = _parser.add_argument_group("Time integration")
 _g_time.add_argument("--n-steps", type=int, default=2000,
                       help="Maximum number of time steps")
-_g_time.add_argument("--cfl", type=float, default=0.1, help="CFL factor for stable dt")
+_g_time.add_argument("--cfl", type=float, default=0.25, help="CFL factor for stable dt")
 
 # --- I/O ---
 _g_io = _parser.add_argument_group("I/O cadence")
@@ -200,7 +200,7 @@ m_vG    = 1.0 - 1.0 / n_vG                    # Van Genuchten m
 g_a     = gamma_w / p_caw0                     # alpha_vG  [1/m]
 
 S_sat   = 1.0
-S_res   = 0.02
+S_res   = 0.045
 g_l     = 0.5          # Mualem pore-connectivity parameter
 
 # Specific storage  (paper Eq. 30)
