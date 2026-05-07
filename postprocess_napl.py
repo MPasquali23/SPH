@@ -61,6 +61,33 @@ def _step_from_name(name):
         return -1
 
 
+def format_time(t_seconds):
+    """Format a physical time (in seconds) for plot titles.
+    Picks the most readable representation based on magnitude:
+      t < 1 s        →  "1.23e-04 s"   (preserve precision for early steps)
+      t < 60 s       →  "42.3 s"
+      t < 3600 s     →  "12m 34s"
+      t < 86400 s    →  "3h 12m 34s"
+      t >= 86400 s   →  "3d 12h 34m 56s"
+    """
+    if t_seconds < 1.0:
+        return f"{t_seconds:.2e} s"
+    if t_seconds < 60.0:
+        return f"{t_seconds:.1f} s"
+
+    # Decompose into integer d/h/m/s
+    total_s = int(round(t_seconds))
+    days,  rem = divmod(total_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    if days > 0:
+        return f"{days}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    return f"{minutes}m {seconds:02d}s"
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -575,7 +602,7 @@ def render_plot1_frame(snap):
     fig1.suptitle(
         f"Saturation slices  (R=Sn, G=Sa, B=Sw)  "
         f"+ water (blue) / NAPL (red) streamlines  "
-        f"—  step {snap['step']:>6d},  t = {snap['time']:7.1f} s",
+        f"—  step {snap['step']:>6d},  t = {format_time(snap['time'])}",
         fontsize=11)
 
 
@@ -642,7 +669,7 @@ def render_plot2_frame(snap):
     ax2.legend(loc="upper right", fontsize=10)
     ax2.set_title(
         f"Saturation profiles at (x={x_axis[ix_src]:.2f}, y={y_axis[iy_src]:.2f}) m"
-        f"\nstep {snap['step']:>6d},  t = {snap['time']:7.1f} s",
+        f"\nstep {snap['step']:>6d},  t = {format_time(snap['time'])}",
         fontsize=11)
 
 
