@@ -41,11 +41,11 @@ import numpy as np
 #   Nx=51  → 132,651 particles
 #   Nx=71  → 357,911 particles
 #   Nx=101 → 1,030,301 particles  (needs ~16 GB RAM)
-GRID_SIZES    = [21, 31, 51, 71]    # Nx = Ny = Nz values to test
-THREAD_COUNTS = [2, 4, 8, 12]     # NUMBA_NUM_THREADS values
+GRID_SIZES    = [21, 31, 51]    # Nx = Ny = Nz values to test
+THREAD_COUNTS = [1, 2, 4, 8, 12]     # NUMBA_NUM_THREADS values
 N_STEPS       = 100                    # steps per benchmark (enough for timing)
 BENCHMARK_SCRIPT = "benchmark_sph_3D.py"
-OUT_DIR       = "../data_sph/scaling_results"
+OUT_DIR       = "/Users/michele/SPH/scaling_results_3D/"
 
 # ======================================================================
 # AUTO-DETECT

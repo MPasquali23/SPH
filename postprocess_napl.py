@@ -108,7 +108,33 @@ parser.add_argument("--alpha", type=float, default=0.7,
 parser.add_argument("--stream-threshold", type=float, default=0.02,
                     help="Mask streamlines below this fraction of max |v| in each slice. "
                          "Default 0.02 (2%%); set to 0 to disable masking.")
+parser.add_argument("--stream-density", type=float, default=1.2,
+                    help="Streamline density factor (matplotlib streamplot 'density'). "
+                         "Lower values = fewer streamlines = faster. Default 1.2")
+parser.add_argument("--stream-grid", type=int, default=30,
+                    help="Decimate the velocity field to AT MOST this many points "
+                         "per axis when computing streamlines. Streamlines need much "
+                         "less resolution than the scatter underneath, so this gives "
+                         "a big speedup on fine grids. Set to 0 to disable decimation "
+                         "(use full grid). Default 30.")
+parser.add_argument("--no-streamlines", action="store_true",
+                    help="Skip streamline rendering entirely. Big speedup for "
+                         "preview / draft animations.")
+parser.add_argument("--workers", type=int, default=0,
+                    help="Number of parallel workers for frame rendering. "
+                         "0 = auto (cpu_count - 1). 1 = serial mode (legacy "
+                         "FuncAnimation). >1 = parallel mode (each frame rendered "
+                         "in a worker process, then ffmpeg stitches). Default 0.")
 args = parser.parse_args()
+
+# Resolve --workers auto setting
+import multiprocessing as _mp
+if args.workers == 0:
+    _N_WORKERS = max(1, _mp.cpu_count() - 1)
+else:
+    _N_WORKERS = max(1, args.workers)
+print(f"Frame rendering: {'parallel' if _N_WORKERS > 1 else 'serial'} "
+      f"({_N_WORKERS} worker{'s' if _N_WORKERS > 1 else ''})")
 
 os.makedirs(args.outdir, exist_ok=True)
 
@@ -477,6 +503,11 @@ def slice_xz(field3, iy):  return field3[:, iy, :]   # (Nx, Nz)
 # ======================================================================
 print("\nBuilding Plot 1 (slice animation: particle scatter + streamlines) ...", flush=True)
 
+import shutil
+import subprocess
+import tempfile
+
+# ── Helpers used in BOTH serial and parallel paths ────────────────────
 
 def mask_low_speed(u, v, threshold_frac):
     """Return (u, v) with cells below threshold_frac * max(|v|) replaced by NaN.
@@ -499,20 +530,51 @@ def mask_low_speed(u, v, threshold_frac):
     return u_out, v_out
 
 
-fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(15, 7), constrained_layout=True)
+def decimate_for_streamplot(axis_a, axis_b, u, v, max_points):
+    """Subsample (axis_a, axis_b, u, v) to at most max_points along each axis.
+    Streamplot integration cost scales with grid size; the visual quality
+    of streamlines barely changes between e.g. 50x50 and 25x25, so this is
+    mostly free quality-wise but a big speedup for fine grids.
 
-# Coordinate flat arrays for scatter (constant across frames)
-Y_yz, Z_yz = np.meshgrid(y_axis, z_axis, indexing="ij")    # (Ny, Nz)
-X_xz, Z_xz = np.meshgrid(x_axis, z_axis, indexing="ij")    # (Nx, Nz)
-yz_y_flat = Y_yz.ravel(); yz_z_flat = Z_yz.ravel()
-xz_x_flat = X_xz.ravel(); xz_z_flat = Z_xz.ravel()
+    max_points <= 0 disables decimation.
+    Inputs assumed shaped: axis_a (Na,), axis_b (Nb,), u/v (Na, Nb).
+    Returns (axis_a', axis_b', u', v') with at most max_points along each axis.
+    """
+    if max_points <= 0:
+        return axis_a, axis_b, u, v
+    Na, Nb = u.shape
+    # ceil division: we want Na/step <= max_points, so step >= Na/max_points
+    step_a = max(1, -(-Na // max_points))
+    step_b = max(1, -(-Nb // max_points))
+    if step_a == 1 and step_b == 1:
+        return axis_a, axis_b, u, v
+    return (axis_a[::step_a], axis_b[::step_b],
+            u[::step_a, ::step_b], v[::step_a, ::step_b])
 
 
-def setup_axes_plot1(ax_yz, ax_xz):
-    ax_yz.set_xlim(0, Ly); ax_yz.set_ylim(0, Lz); ax_yz.set_aspect("equal")
+def draw_streamlines(ax, axis_a, axis_b, u, v, color, density,
+                      stream_thresh, stream_grid, draw_streamlines_flag):
+    """Compose mask + decimate + streamplot. Returns silently if disabled
+    or if the field has no significant flow."""
+    if not draw_streamlines_flag:
+        return
+    u_m, v_m = mask_low_speed(u, v, stream_thresh)
+    if np.nanmax(np.abs(u_m) + np.abs(v_m)) < 1e-25:
+        return
+    a_d, b_d, u_d, v_d = decimate_for_streamplot(axis_a, axis_b, u_m, v_m,
+                                                   stream_grid)
+    ax.streamplot(a_d, b_d, u_d.T, v_d.T,
+                   color=color, linewidth=0.9, density=density,
+                   arrowsize=1.0, arrowstyle="->")
+
+
+def setup_axes_plot1(ax_yz, ax_xz, geom):
+    """Configure the two slice panels (idempotent)."""
+    Lx_, Ly_, Lz_ = geom["Lx"], geom["Ly"], geom["Lz"]
+    ax_yz.set_xlim(0, Ly_); ax_yz.set_ylim(0, Lz_); ax_yz.set_aspect("equal")
     ax_yz.set_xlabel("y [m]"); ax_yz.set_ylabel("z [m]")
-    ax_yz.set_facecolor("#f4f4f4")     # neutral grey so gaps between particles read as 'between'
-    ax_xz.set_xlim(0, Lx); ax_xz.set_ylim(0, Lz); ax_xz.set_aspect("equal")
+    ax_yz.set_facecolor("#f4f4f4")
+    ax_xz.set_xlim(0, Lx_); ax_xz.set_ylim(0, Lz_); ax_xz.set_aspect("equal")
     ax_xz.set_xlabel("x [m]"); ax_xz.set_ylabel("z [m]")
     ax_xz.set_facecolor("#f4f4f4")
 
@@ -532,102 +594,331 @@ def marker_size_for(ax, dx_axis, fill_fraction=0.65):
     return diameter_pt ** 2
 
 
-# Force one draw to give the axes a real window extent so marker_size_for works.
-setup_axes_plot1(ax1a, ax1b)
-fig1.canvas.draw()
-size_yz = marker_size_for(ax1a, dy)    # YZ slice: marker spans dy in y-direction
-size_xz = marker_size_for(ax1b, dx)    # XZ slice: marker spans dx in x-direction
+def _draw_plot1_into_axes(ax_yz, ax_xz, fig, snap, geom,
+                          alpha_val, stream_thresh, stream_density,
+                          stream_grid, draw_streamlines_flag):
+    """Pure rendering function: clear & redraw both panels for one frame.
+    Used by both the serial FuncAnimation path and the parallel worker path.
+    Uses only its arguments — no module-level state — so it can run inside
+    a worker process.
+    """
+    Nx_, Ny_, Nz_ = geom["Nx"], geom["Ny"], geom["Nz"]
+    ix_src_ = geom["ix_src"]; iy_src_ = geom["iy_src"]
+    x_axis_ = geom["x_axis"]; y_axis_ = geom["y_axis"]; z_axis_ = geom["z_axis"]
+    SRC_X0_, SRC_X1_ = geom["SRC_X0"], geom["SRC_X1"]
+    SRC_Y0_, SRC_Y1_ = geom["SRC_Y0"], geom["SRC_Y1"]
+    SRC_Z0_, SRC_Z1_ = geom["SRC_Z0"], geom["SRC_Z1"]
+    yz_y_flat_ = geom["yz_y_flat"]; yz_z_flat_ = geom["yz_z_flat"]
+    xz_x_flat_ = geom["xz_x_flat"]; xz_z_flat_ = geom["xz_z_flat"]
+    size_yz_ = geom["size_yz"]; size_xz_ = geom["size_xz"]
 
+    ax_yz.clear(); ax_xz.clear()
+    setup_axes_plot1(ax_yz, ax_xz, geom)
 
-def render_plot1_frame(snap):
-    ax1a.clear(); ax1b.clear()
-    setup_axes_plot1(ax1a, ax1b)
+    Sw3 = np.clip(snap["Sw"], 0, 1).reshape(Nx_, Ny_, Nz_)
+    Sn3 = np.clip(snap["Sn"], 0, 1).reshape(Nx_, Ny_, Nz_)
+    Sa3 = np.clip(1.0 - Sw3 - Sn3, 0, 1)
 
-    Sw3, Sn3, Sa3 = saturations_from(snap["Sw"], snap["Sn"])
-    qx3 = to3d(snap["qx"]); qy3 = to3d(snap["qy"]); qz3 = to3d(snap["qz"])
+    qx3 = snap["qx"].reshape(Nx_, Ny_, Nz_)
+    qy3 = snap["qy"].reshape(Nx_, Ny_, Nz_)
+    qz3 = snap["qz"].reshape(Nx_, Ny_, Nz_)
+    has_napl = "qxn" in snap
+    if has_napl:
+        qxn3 = snap["qxn"].reshape(Nx_, Ny_, Nz_)
+        qyn3 = snap["qyn"].reshape(Nx_, Ny_, Nz_)
+        qzn3 = snap["qzn"].reshape(Nx_, Ny_, Nz_)
 
-    if "qxn" in snap:
-        qxn3 = to3d(snap["qxn"]); qyn3 = to3d(snap["qyn"]); qzn3 = to3d(snap["qzn"])
-    else:
-        qxn3 = qyn3 = qzn3 = None
+    # ── YZ slice ──
+    rgb_yz = np.zeros((Ny_, Nz_, 3), dtype=np.float32)
+    rgb_yz[..., 0] = Sn3[ix_src_, :, :]
+    rgb_yz[..., 1] = Sa3[ix_src_, :, :]
+    rgb_yz[..., 2] = Sw3[ix_src_, :, :]
+    ax_yz.scatter(yz_y_flat_, yz_z_flat_, c=rgb_yz.reshape(-1, 3),
+                  marker="o", s=size_yz_, edgecolors="none", alpha=alpha_val)
 
-    # ── YZ slice at x = x_axis[ix_src] ──
-    Sw_yz = slice_yz(Sw3, ix_src); Sn_yz = slice_yz(Sn3, ix_src); Sa_yz = slice_yz(Sa3, ix_src)
-    rgb_yz = rgb_from(Sw_yz, Sn_yz, Sa_yz).reshape(-1, 3)
-    ax1a.scatter(yz_y_flat, yz_z_flat, c=rgb_yz, marker="o",
-                 s=size_yz, edgecolors="none", alpha=args.alpha)
+    draw_streamlines(ax_yz, y_axis_, z_axis_,
+                      qy3[ix_src_, :, :], qz3[ix_src_, :, :],
+                      "blue", stream_density,
+                      stream_thresh, stream_grid, draw_streamlines_flag)
+    if has_napl:
+        draw_streamlines(ax_yz, y_axis_, z_axis_,
+                          qyn3[ix_src_, :, :], qzn3[ix_src_, :, :],
+                          "red", stream_density,
+                          stream_thresh, stream_grid, draw_streamlines_flag)
 
-    qy_yz_w = slice_yz(qy3, ix_src); qz_yz_w = slice_yz(qz3, ix_src)
-    qy_yz_w_m, qz_yz_w_m = mask_low_speed(qy_yz_w, qz_yz_w, args.stream_threshold)
-    if np.nanmax(np.abs(qy_yz_w_m) + np.abs(qz_yz_w_m)) > 1e-25:
-        ax1a.streamplot(y_axis, z_axis, qy_yz_w_m.T, qz_yz_w_m.T,
-                         color="blue", linewidth=0.9, density=1.2,
-                         arrowsize=1.0, arrowstyle="->")
-    if qyn3 is not None:
-        qy_yz_n = slice_yz(qyn3, ix_src); qz_yz_n = slice_yz(qzn3, ix_src)
-        qy_yz_n_m, qz_yz_n_m = mask_low_speed(qy_yz_n, qz_yz_n, args.stream_threshold)
-        if np.nanmax(np.abs(qy_yz_n_m) + np.abs(qz_yz_n_m)) > 1e-25:
-            ax1a.streamplot(y_axis, z_axis, qy_yz_n_m.T, qz_yz_n_m.T,
-                             color="red", linewidth=0.9, density=1.2,
-                             arrowsize=1.0, arrowstyle="->")
+    ax_yz.add_patch(Rectangle((SRC_Y0_, SRC_Z0_), SRC_Y1_-SRC_Y0_, SRC_Z1_-SRC_Z0_,
+                               lw=2, ec="k", fc="none", ls="--"))
+    ax_yz.set_title(f"YZ slice at x={x_axis_[ix_src_]:.2f} m")
 
-    ax1a.add_patch(Rectangle((SRC_Y0, SRC_Z0), SRC_Y1-SRC_Y0, SRC_Z1-SRC_Z0,
-                              lw=2, ec="k", fc="none", ls="--"))
-    ax1a.set_title(f"YZ slice at x={x_axis[ix_src]:.2f} m")
+    # ── XZ slice ──
+    rgb_xz = np.zeros((Nx_, Nz_, 3), dtype=np.float32)
+    rgb_xz[..., 0] = Sn3[:, iy_src_, :]
+    rgb_xz[..., 1] = Sa3[:, iy_src_, :]
+    rgb_xz[..., 2] = Sw3[:, iy_src_, :]
+    ax_xz.scatter(xz_x_flat_, xz_z_flat_, c=rgb_xz.reshape(-1, 3),
+                  marker="o", s=size_xz_, edgecolors="none", alpha=alpha_val)
 
-    # ── XZ slice at y = y_axis[iy_src] ──
-    Sw_xz = slice_xz(Sw3, iy_src); Sn_xz = slice_xz(Sn3, iy_src); Sa_xz = slice_xz(Sa3, iy_src)
-    rgb_xz = rgb_from(Sw_xz, Sn_xz, Sa_xz).reshape(-1, 3)
-    ax1b.scatter(xz_x_flat, xz_z_flat, c=rgb_xz, marker="o",
-                 s=size_xz, edgecolors="none", alpha=args.alpha)
+    draw_streamlines(ax_xz, x_axis_, z_axis_,
+                      qx3[:, iy_src_, :], qz3[:, iy_src_, :],
+                      "blue", stream_density + 0.3,
+                      stream_thresh, stream_grid, draw_streamlines_flag)
+    if has_napl:
+        draw_streamlines(ax_xz, x_axis_, z_axis_,
+                          qxn3[:, iy_src_, :], qzn3[:, iy_src_, :],
+                          "red", stream_density + 0.3,
+                          stream_thresh, stream_grid, draw_streamlines_flag)
 
-    qx_xz_w = slice_xz(qx3, iy_src); qz_xz_w = slice_xz(qz3, iy_src)
-    qx_xz_w_m, qz_xz_w_m = mask_low_speed(qx_xz_w, qz_xz_w, args.stream_threshold)
-    if np.nanmax(np.abs(qx_xz_w_m) + np.abs(qz_xz_w_m)) > 1e-25:
-        ax1b.streamplot(x_axis, z_axis, qx_xz_w_m.T, qz_xz_w_m.T,
-                         color="blue", linewidth=0.9, density=1.5,
-                         arrowsize=1.0, arrowstyle="->")
-    if qxn3 is not None:
-        qx_xz_n = slice_xz(qxn3, iy_src); qz_xz_n = slice_xz(qzn3, iy_src)
-        qx_xz_n_m, qz_xz_n_m = mask_low_speed(qx_xz_n, qz_xz_n, args.stream_threshold)
-        if np.nanmax(np.abs(qx_xz_n_m) + np.abs(qz_xz_n_m)) > 1e-25:
-            ax1b.streamplot(x_axis, z_axis, qx_xz_n_m.T, qz_xz_n_m.T,
-                             color="red", linewidth=0.9, density=1.5,
-                             arrowsize=1.0, arrowstyle="->")
+    ax_xz.add_patch(Rectangle((SRC_X0_, SRC_Z0_), SRC_X1_-SRC_X0_, SRC_Z1_-SRC_Z0_,
+                               lw=2, ec="k", fc="none", ls="--"))
+    ax_xz.set_title(f"XZ slice at y={y_axis_[iy_src_]:.2f} m")
 
-    ax1b.add_patch(Rectangle((SRC_X0, SRC_Z0), SRC_X1-SRC_X0, SRC_Z1-SRC_Z0,
-                              lw=2, ec="k", fc="none", ls="--"))
-    ax1b.set_title(f"XZ slice at y={y_axis[iy_src]:.2f} m")
-
-    fig1.suptitle(
+    fig.suptitle(
         f"Saturation slices  (R=Sn, G=Sa, B=Sw)  "
         f"+ water (blue) / NAPL (red) streamlines  "
         f"—  step {snap['step']:>6d},  t = {format_time(snap['time'])}",
         fontsize=11)
 
 
-def animate_plot1(frame_idx):
-    render_plot1_frame(snaps[frame_idx])
-
-print(f"  Rendering {len(snaps)} frames ...", flush=True)
-render_plot1_frame(snaps[0])
-anim1 = animation.FuncAnimation(fig1, animate_plot1, frames=len(snaps),
-                                  interval=1000//args.fps)
-
-out_path1 = os.path.join(args.outdir, "anim_slices_rgb")
-saved = False
-for ext, writer_name in [("mp4", "ffmpeg"), ("gif", "pillow")]:
+def _render_frame_worker(task):
+    """Worker: build a fresh figure, render one frame, save PNG, close.
+    Top-level (picklable). All arguments come through `task`.
+    """
+    (idx, snap, geom, png_path, dpi, alpha_val,
+     stream_thresh, stream_density, stream_grid, draw_streamlines_flag) = task
+    # Each worker creates its own figure (matplotlib figures are NOT
+    # safe to share across processes).
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    fig, (ax_yz, ax_xz) = _plt.subplots(1, 2, figsize=(15, 7),
+                                          constrained_layout=True)
+    # First draw to give axes a real bbox so marker_size_for would work.
+    # We don't recompute size here — geom carries the parent-computed values.
+    setup_axes_plot1(ax_yz, ax_xz, geom)
+    fig.canvas.draw()
     try:
-        full = out_path1 + "." + ext
-        anim1.save(full, writer=writer_name, fps=args.fps, dpi=args.dpi)
-        print(f"  Saved {full}")
-        saved = True
-        break
-    except Exception as e:
-        print(f"  ({writer_name} failed: {e})")
+        _draw_plot1_into_axes(ax_yz, ax_xz, fig, snap, geom,
+                               alpha_val, stream_thresh, stream_density,
+                               stream_grid, draw_streamlines_flag)
+        fig.savefig(png_path, dpi=dpi)
+    finally:
+        _plt.close(fig)
+    return idx
+
+
+# ── Compute marker sizes from a one-shot reference figure ───────────
+# (sizes depend on the actual rendered axis pixel extent, which depends
+# on figsize and DPI; both are the same in serial and parallel paths)
+_ref_fig, (_ref_yz, _ref_xz) = plt.subplots(1, 2, figsize=(15, 7),
+                                              constrained_layout=True)
+
+# Build the geom dict that travels everywhere (worker, serial path)
+Y_yz_full, Z_yz_full = np.meshgrid(y_axis, z_axis, indexing="ij")
+X_xz_full, Z_xz_full = np.meshgrid(x_axis, z_axis, indexing="ij")
+
+geom = {
+    "Nx": Nx, "Ny": Ny, "Nz": Nz,
+    "Lx": Lx, "Ly": Ly, "Lz": Lz,
+    "ix_src": ix_src, "iy_src": iy_src,
+    "x_axis": x_axis, "y_axis": y_axis, "z_axis": z_axis,
+    "SRC_X0": SRC_X0, "SRC_X1": SRC_X1,
+    "SRC_Y0": SRC_Y0, "SRC_Y1": SRC_Y1,
+    "SRC_Z0": SRC_Z0, "SRC_Z1": SRC_Z1,
+    "yz_y_flat": Y_yz_full.ravel(), "yz_z_flat": Z_yz_full.ravel(),
+    "xz_x_flat": X_xz_full.ravel(), "xz_z_flat": Z_xz_full.ravel(),
+    "size_yz": None, "size_xz": None,   # filled in next
+}
+setup_axes_plot1(_ref_yz, _ref_xz, geom)
+_ref_fig.canvas.draw()
+geom["size_yz"] = marker_size_for(_ref_yz, dy)
+geom["size_xz"] = marker_size_for(_ref_xz, dx)
+plt.close(_ref_fig)
+
+
+# ── Decide rendering path ────────────────────────────────────────────
+n_frames = len(snaps)
+out_path1_base = os.path.join(args.outdir, "anim_slices_rgb")
+saved = False
+
+# Check for ffmpeg availability — required for the parallel path
+_FFMPEG = shutil.which("ffmpeg")
+
+
+def _probe_ffmpeg_encoders(ffmpeg_path):
+    """Return a set of available video encoder names from `ffmpeg -encoders`.
+    Empty set on failure (caller should treat as "unknown, try anyway").
+    """
+    try:
+        proc = subprocess.run([ffmpeg_path, "-hide_banner", "-encoders"],
+                              capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return set()
+        names = set()
+        for line in proc.stdout.splitlines():
+            # Lines look like:  " V..... libx264              libx264 H.264 / AVC ..."
+            # The encoder name is the first non-empty token after the flags column.
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].startswith(("V", "A", "S")):
+                names.add(parts[1])
+        return names
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+
+# Candidate (extension, codec, extra_args) triples in preference order.
+# Picked so the first match gives the best-quality H.264 MP4, with
+# graceful degradation through ubiquitous-but-larger codecs and finally
+# to GIF (which doesn't need ffmpeg encoders at all — handled separately).
+_ENCODER_CANDIDATES = [
+    # (codec_name, output_ext, extra_codec_args)
+    ("libx264",            "mp4", ["-pix_fmt", "yuv420p", "-preset", "fast"]),
+    ("h264_videotoolbox",  "mp4", ["-pix_fmt", "yuv420p"]),   # macOS hardware
+    ("h264_nvenc",         "mp4", ["-pix_fmt", "yuv420p"]),   # NVIDIA hardware
+    ("libopenh264",        "mp4", ["-pix_fmt", "yuv420p"]),   # Cisco
+    ("mpeg4",              "mp4", ["-q:v", "5"]),             # ubiquitous fallback
+    ("mpeg4",              "mov", ["-q:v", "5"]),             # if mpeg4-in-mp4 muxing fails
+]
+_use_parallel = (_N_WORKERS > 1) and (_FFMPEG is not None)
+if _N_WORKERS > 1 and _FFMPEG is None:
+    print(f"  WARNING: ffmpeg not found on PATH; falling back to serial mode")
+
+if _use_parallel:
+    # ─── PARALLEL PATH ────────────────────────────────────────────────
+    # Render each frame to a PNG in a worker process, then have ffmpeg
+    # stitch them into an MP4. Roughly N_workers× faster than serial
+    # for streamplot-heavy frames.
+    with tempfile.TemporaryDirectory(prefix="sph_anim_", dir=args.outdir) as tmpdir:
+        tasks = []
+        for idx, snap in enumerate(snaps):
+            png_path = os.path.join(tmpdir, f"frame_{idx:06d}.png")
+            tasks.append((idx, snap, geom, png_path, args.dpi,
+                          args.alpha, args.stream_threshold, args.stream_density,
+                          args.stream_grid, not args.no_streamlines))
+
+        print(f"  Rendering {n_frames} frames with {_N_WORKERS} workers ...",
+              flush=True)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        try:
+            ctx = _mp.get_context("fork")
+        except ValueError:
+            print(f"  NOTE: 'fork' start method unavailable; using 'spawn' "
+                  f"(slower worker startup)")
+            ctx = _mp.get_context("spawn")
+
+        import time as _time
+        _t_render_start = _time.time()
+        completed = 0
+        try:
+            with ProcessPoolExecutor(max_workers=_N_WORKERS,
+                                       mp_context=ctx) as pool:
+                futures = [pool.submit(_render_frame_worker, t) for t in tasks]
+                for fut in as_completed(futures):
+                    try:
+                        idx = fut.result()
+                        completed += 1
+                        if completed % max(1, n_frames // 10) == 0:
+                            elapsed = _time.time() - _t_render_start
+                            rate = completed / elapsed if elapsed > 0 else 0
+                            eta = (n_frames - completed) / rate if rate > 0 else 0
+                            print(f"    ... {completed}/{n_frames} frames "
+                                  f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
+                    except Exception as e:
+                        print(f"    WORKER FAILED: {type(e).__name__}: {e}")
+            _t_render = _time.time() - _t_render_start
+            print(f"  Rendered {completed}/{n_frames} frames in {_t_render:.1f}s "
+                  f"({completed/_t_render:.1f} fr/s)", flush=True)
+        except Exception as e:
+            print(f"  ERROR in parallel rendering: {e}; falling back to serial")
+            _use_parallel = False
+
+        if _use_parallel and completed > 0:
+            # ffmpeg stitch — try a chain of encoders, fall back through
+            # codecs and containers as needed.  The first one that actually
+            # produces a valid file wins.
+            available = _probe_ffmpeg_encoders(_FFMPEG)
+            if available:
+                # Filter the candidate list to encoders we know are present.
+                # If probing failed (empty set), try them all anyway — the
+                # `-encoders` listing is informational; some builds may still
+                # accept encoders that don't appear there.
+                candidates = [(c, e, a) for (c, e, a) in _ENCODER_CANDIDATES
+                              if c in available]
+                if not candidates:
+                    print(f"  WARNING: none of the preferred encoders are available "
+                          f"in this ffmpeg build. Trying mpeg4 as last resort.")
+                    candidates = [("mpeg4", "mp4", ["-q:v", "5"])]
+            else:
+                candidates = list(_ENCODER_CANDIDATES)
+
+            print(f"  Encoding video ({len(candidates)} encoder candidate"
+                  f"{'s' if len(candidates) > 1 else ''}) ...", flush=True)
+
+            input_pattern = os.path.join(tmpdir, "frame_%06d.png")
+            for codec, ext, extra in candidates:
+                out_path = out_path1_base + "." + ext
+                cmd = [_FFMPEG, "-y",
+                       "-framerate", str(args.fps),
+                       "-i", input_pattern,
+                       "-c:v", codec,
+                       *extra,
+                       "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                       out_path]
+                _t_enc = _time.time()
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    _t_enc = _time.time() - _t_enc
+                    if proc.returncode == 0:
+                        print(f"  Saved {out_path}  "
+                              f"(codec={codec}, encode: {_t_enc:.1f}s)")
+                        saved = True
+                        break
+                    else:
+                        # Show only the last meaningful error line
+                        err_tail = proc.stderr.strip().splitlines()[-1] \
+                                   if proc.stderr.strip() else "(no stderr)"
+                        print(f"  encoder '{codec}' failed: {err_tail}")
+                except Exception as e:
+                    print(f"  encoder '{codec}' invocation failed: {e}")
+
+            if not saved:
+                print(f"  All ffmpeg encoder candidates failed; "
+                      f"will fall back to serial mode (which can write GIF).")
+
+if not saved:
+    # ─── SERIAL PATH (FuncAnimation) ──────────────────────────────────
+    # Either the user asked for serial, or parallel rendering failed.
+    # Falls back to FuncAnimation; supports both MP4 (via ffmpeg) and
+    # GIF (via Pillow) writers.
+    print(f"  Rendering {n_frames} frames serially ...", flush=True)
+    fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(15, 7),
+                                        constrained_layout=True)
+    setup_axes_plot1(ax1a, ax1b, geom)
+    fig1.canvas.draw()
+
+    def _animate(frame_idx):
+        _draw_plot1_into_axes(ax1a, ax1b, fig1, snaps[frame_idx], geom,
+                               args.alpha, args.stream_threshold, args.stream_density,
+                               args.stream_grid, not args.no_streamlines)
+
+    _draw_plot1_into_axes(ax1a, ax1b, fig1, snaps[0], geom,
+                           args.alpha, args.stream_threshold, args.stream_density,
+                           args.stream_grid, not args.no_streamlines)
+    anim1 = animation.FuncAnimation(fig1, _animate, frames=n_frames,
+                                      interval=1000//args.fps)
+    for ext, writer_name in [("mp4", "ffmpeg"), ("gif", "pillow")]:
+        try:
+            full = out_path1_base + "." + ext
+            anim1.save(full, writer=writer_name, fps=args.fps, dpi=args.dpi)
+            print(f"  Saved {full}")
+            saved = True
+            break
+        except Exception as e:
+            print(f"  ({writer_name} failed: {e})")
+    plt.close(fig1)
+
 if not saved:
     print("  ERROR: could not save Plot 1 animation")
-plt.close(fig1)
+
 
 
 # ======================================================================
