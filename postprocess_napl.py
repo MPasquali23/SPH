@@ -100,8 +100,12 @@ parser.add_argument("--skip",   type=int, default=1,
                     help="Use every Nth snapshot (default: 1)")
 parser.add_argument("--fps",    type=int, default=8,
                     help="Animation frame rate (default: 8)")
-parser.add_argument("--dpi",    type=int, default=120,
-                    help="Output DPI (default: 120)")
+parser.add_argument("--dpi",    type=int, default=200,
+                    help="Output DPI for rasterized frames (default: 200). "
+                         "Scatter plots with many small markers benefit from "
+                         "higher DPI than line plots. 120 gives 1800x840 px "
+                         "(HD-ish); 200 gives 3000x1400 (sharper); 250+ for "
+                         "publication-grade.")
 parser.add_argument("--alpha", type=float, default=0.7,
                     help="Marker transparency (0=invisible, 1=opaque). "
                          "Lower values reveal phase mixing more clearly. Default 0.7")
@@ -125,6 +129,20 @@ parser.add_argument("--workers", type=int, default=0,
                          "0 = auto (cpu_count - 1). 1 = serial mode (legacy "
                          "FuncAnimation). >1 = parallel mode (each frame rendered "
                          "in a worker process, then ffmpeg stitches). Default 0.")
+parser.add_argument("--quality", choices=["high", "medium", "low"], default="high",
+                    help="Video quality preset. 'high' = visually lossless "
+                         "(CRF 18 for libx264, ~12 Mb/s for hardware encoders). "
+                         "'medium' = good (CRF 23, ~6 Mb/s). 'low' = small files "
+                         "(CRF 28, ~2 Mb/s). Default high — recommended for "
+                         "scientific visualizations with sharp particle edges.")
+parser.add_argument("--pix-fmt", choices=["yuv420p", "yuv444p"], default="yuv420p",
+                    help="Video pixel format. yuv420p (default) uses 4:2:0 chroma "
+                         "subsampling — universally playable, but discards 75%% of "
+                         "color resolution which can muddy fine red/blue/green details "
+                         "on a grey background. yuv444p keeps full chroma fidelity "
+                         "(sharper colored particles) but is rejected by some players "
+                         "(notably old QuickTime / iOS Safari). Use yuv444p for "
+                         "scientific archival, yuv420p for sharing.")
 args = parser.parse_args()
 
 # Resolve --workers auto setting
@@ -765,19 +783,54 @@ def _probe_ffmpeg_encoders(ffmpeg_path):
         return set()
 
 
+# Quality-preset → encoder argument mapping.
+# CRF (Constant Rate Factor) is x264/x265's quality control: lower = better.
+# 18 is "visually lossless" for typical content; for sharp scientific viz with
+# fine line/marker detail we use 18 by default to keep particle edges crisp.
+# Hardware encoders (videotoolbox / nvenc) don't support CRF; we use bitrate.
+_QUALITY_PRESETS = {
+    # name : (crf_value, bitrate_for_hw, mpeg4_q, openh264_bitrate)
+    "high":   (18, "12M", "2", "10M"),
+    "medium": (23,  "6M", "5",  "5M"),
+    "low":    (28,  "2M", "8",  "2M"),
+}
+
+
+def _build_encoder_candidates(quality, pix_fmt):
+    """Build the (codec, ext, extra_args) candidate list for the chosen quality.
+    Order = preference (best-quality H.264 first, ubiquitous fallbacks last).
+    """
+    crf, bitrate, mpeg4_q, oh264_bitrate = _QUALITY_PRESETS[quality]
+    return [
+        # libx264: CRF-based, highest quality at chosen point. -preset slow gives
+        # better compression at small extra encode time vs medium/fast (we use
+        # medium since this matters for parallel encode wall time on long runs).
+        ("libx264",          "mp4", ["-pix_fmt", pix_fmt,
+                                     "-crf", str(crf),
+                                     "-preset", "medium"]),
+        # videotoolbox: hardware H.264 on macOS. Bitrate-based; -allow_sw
+        # permits software fallback if hardware path fails.
+        ("h264_videotoolbox","mp4", ["-pix_fmt", pix_fmt,
+                                     "-b:v", bitrate,
+                                     "-allow_sw", "1"]),
+        # nvenc: NVIDIA hardware. Use CQ (constant quality) mode roughly
+        # matching CRF for visual equivalence.
+        ("h264_nvenc",       "mp4", ["-pix_fmt", pix_fmt,
+                                     "-rc", "vbr",
+                                     "-cq", str(crf),
+                                     "-b:v", bitrate]),
+        # libopenh264: Cisco's H.264; bitrate-based.
+        ("libopenh264",      "mp4", ["-pix_fmt", pix_fmt,
+                                     "-b:v", oh264_bitrate]),
+        # mpeg4: ubiquitous fallback. Larger files but plays everywhere.
+        # mpeg4 does not support yuv444p; force yuv420p for these.
+        ("mpeg4",            "mp4", ["-pix_fmt", "yuv420p", "-q:v", mpeg4_q]),
+        ("mpeg4",            "mov", ["-pix_fmt", "yuv420p", "-q:v", mpeg4_q]),
+    ]
+
+
 # Candidate (extension, codec, extra_args) triples in preference order.
-# Picked so the first match gives the best-quality H.264 MP4, with
-# graceful degradation through ubiquitous-but-larger codecs and finally
-# to GIF (which doesn't need ffmpeg encoders at all — handled separately).
-_ENCODER_CANDIDATES = [
-    # (codec_name, output_ext, extra_codec_args)
-    ("libx264",            "mp4", ["-pix_fmt", "yuv420p", "-preset", "fast"]),
-    ("h264_videotoolbox",  "mp4", ["-pix_fmt", "yuv420p"]),   # macOS hardware
-    ("h264_nvenc",         "mp4", ["-pix_fmt", "yuv420p"]),   # NVIDIA hardware
-    ("libopenh264",        "mp4", ["-pix_fmt", "yuv420p"]),   # Cisco
-    ("mpeg4",              "mp4", ["-q:v", "5"]),             # ubiquitous fallback
-    ("mpeg4",              "mov", ["-q:v", "5"]),             # if mpeg4-in-mp4 muxing fails
-]
+_ENCODER_CANDIDATES = _build_encoder_candidates(args.quality, args.pix_fmt)
 _use_parallel = (_N_WORKERS > 1) and (_FFMPEG is not None)
 if _N_WORKERS > 1 and _FFMPEG is None:
     print(f"  WARNING: ffmpeg not found on PATH; falling back to serial mode")
