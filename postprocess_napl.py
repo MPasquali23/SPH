@@ -14,9 +14,15 @@ Reads sph_napl_snapshots.h5 and produces animations:
 Usage
 -----
     python postprocess_napl.py
-    python postprocess_napl.py --input my_run.h5 --outdir figs/
+    python postprocess_napl.py --input my_run/snapshots --outdir figs/
+    python postprocess_napl.py --input my_run/           # auto-detect snapshots/ subdir
     python postprocess_napl.py --skip 5         # use every 5th snapshot
     python postprocess_napl.py --fps 10
+
+The simulation writes one HDF5 (or NPZ) file per snapshot to
+$OUTDIR/snapshots/step_NNNNNNNNNNNN.{h5,npz}.  Point --input at either
+the snapshots/ directory itself or at the run's --outdir (we auto-find
+the snapshots/ subdirectory in that case).
 """
 
 import argparse
@@ -92,8 +98,11 @@ def format_time(t_seconds):
 # CLI
 # ======================================================================
 parser = argparse.ArgumentParser(description="Animated post-processing of SPH snapshots")
-parser.add_argument("--input",  default="sph_napl_snapshots.h5",
-                    help="HDF5 snapshot file (default: sph_napl_snapshots.h5)")
+parser.add_argument("--input",  default="snapshots",
+                    help="Path to per-snapshot files. Either the snapshots/ "
+                         "directory directly (containing step_*.h5 or "
+                         "step_*.npz files), or a run's --outdir (we look for "
+                         "snapshots/ inside it). Default: ./snapshots")
 parser.add_argument("--outdir", default=".",
                     help="Output directory for animations (default: cwd)")
 parser.add_argument("--skip",   type=int, default=1,
@@ -157,10 +166,7 @@ print(f"Frame rendering: {'parallel' if _N_WORKERS > 1 else 'serial'} "
 os.makedirs(args.outdir, exist_ok=True)
 
 if not HAS_H5:
-    print("NOTE: h5py not available — falling back to NPZ snapshots in 'snapshots/' directory.")
-
-if HAS_H5 and not os.path.exists(args.input):
-    print(f"NOTE: HDF5 file not found ({args.input}); trying NPZ snapshots ...")
+    print("NOTE: h5py not available — only NPZ snapshots can be read.")
 
 
 # ======================================================================
@@ -193,125 +199,13 @@ def _validate_h5_snapshot(group, expected_npart):
     return True, None
 
 
-def load_from_hdf5(path):
-    print(f"Reading {path} ...", flush=True)
-
-    # Step 1: try to open the file at all
-    try:
-        h5_file = h5py.File(path, "r")
-    except (OSError, IOError) as e:
-        raise RuntimeError(
-            f"Cannot open HDF5 file {path}: {e}\n"
-            f"  This typically means the file is incomplete or corrupted.\n"
-            f"  Try:\n"
-            f"    - Re-running rsync to ensure full transfer\n"
-            f"    - 'h5ls {path}' to inspect structure\n"
-            f"    - 'h5repack {path} {path}.repacked' to recover salvageable data"
-        ) from e
-
-    snaps = []
-    skipped = []      # list of (group_name, reason)
-    meta = None
-
-    with h5_file as f:
-        # Step 2: list groups (cheap; usually works even if some groups are bad)
-        try:
-            groups = sorted([k for k in f.keys() if k.startswith("step_")],
-                             key=_step_from_name)
-        except (OSError, RuntimeError) as e:
-            raise RuntimeError(f"Cannot list groups in {path}: {e}") from e
-
-        if len(groups) == 0:
-            raise RuntimeError(f"No step_* groups found in {path}")
-
-        # Step 3: find the first VALID group to extract geometry metadata
-        for k in groups:
-            try:
-                g = f[k]
-                ok, reason = _validate_h5_snapshot(g, expected_npart=None)
-                if not ok:
-                    skipped.append((k, reason))
-                    continue
-                Nx_ = int(g.attrs["Nx"])
-                Ny_ = int(g.attrs["Ny"])
-                Nz_ = int(g.attrs["Nz"])
-                expected_npart = Nx_ * Ny_ * Nz_
-                meta = {
-                    "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
-                    "Lx": float(g.attrs["Lx"]),
-                    "Ly": float(g.attrs["Ly"]),
-                    "Lz": float(g.attrs["Lz"]),
-                    "x": g["x"][...], "y": g["y"][...], "z": g["z"][...],
-                    "is_source": g["is_source"][...].astype(bool),
-                    "has_napl_q": ("qxn" in g) and ("qyn" in g) and ("qzn" in g),
-                }
-                break
-            except _H5_ERRORS as e:
-                skipped.append((k, f"metadata read failed: {type(e).__name__}: {e}"))
-                continue
-
-        if meta is None:
-            raise RuntimeError(
-                f"All {len(groups)} snapshot groups in {path} are unreadable.\n"
-                f"  First failures: {skipped[:3]}"
-            )
-
-        expected_npart = meta["Nx"] * meta["Ny"] * meta["Nz"]
-        # Apply --skip subsampling
-        groups_subset = groups[::args.skip]
-
-        # Snapshots that already failed metadata search are skipped
-        already_failed = {k for k, _ in skipped}
-
-        # Step 4: read each snapshot, skipping bad ones
-        for k in groups_subset:
-            if k in already_failed:
-                continue
-            try:
-                g = f[k]
-                ok, reason = _validate_h5_snapshot(g, expected_npart)
-                if not ok:
-                    skipped.append((k, reason))
-                    continue
-
-                # Now fetch the data. This is where I/O errors on truncated
-                # datasets actually trigger. Catch and skip.
-                d = {"step": int(g.attrs["step"]),
-                     "time": float(g.attrs["time_s"]),
-                     "h":  g["h"][...],  "Sn": g["Sn"][...], "Sw": g["Sw"][...],
-                     "qx": g["qx"][...], "qy": g["qy"][...], "qz": g["qz"][...]}
-                if meta["has_napl_q"]:
-                    # NAPL velocity may be missing only on this snapshot
-                    if "qxn" in g and "qyn" in g and "qzn" in g:
-                        d["qxn"] = g["qxn"][...]
-                        d["qyn"] = g["qyn"][...]
-                        d["qzn"] = g["qzn"][...]
-                snaps.append(d)
-            except _H5_ERRORS as e:
-                skipped.append((k, f"read failed: {type(e).__name__}: {e}"))
-                continue
-
-    # Report skipped snapshots
-    if skipped:
-        print(f"  WARNING: skipped {len(skipped)} unreadable snapshot(s):")
-        for k, reason in skipped[:5]:
-            print(f"    - {k}: {reason}")
-        if len(skipped) > 5:
-            print(f"    ... and {len(skipped) - 5} more")
-        print(f"  Likely cause: incomplete rsync transfer, partial write, "
-              f"or file corruption.")
-
-    if len(snaps) == 0:
-        raise RuntimeError(
-            f"No usable snapshots in {path} after skipping {len(skipped)} bad ones."
-        )
-
-    return meta, snaps
-
-
 def _validate_npz_keys(loader, expected_npart):
     """Return (ok, reason) for whether an NPZ snapshot has all required keys
-    with correct shapes. Doesn't load full data arrays."""
+    with correct first-axis shape. Cheap: doesn't load full data arrays.
+
+    Catches the same partial-write / truncated-file failure modes as the
+    HDF5 validator: missing keys, wrong shape, or low-level I/O errors.
+    """
     required = ("step", "time_s", "Nx", "Ny", "Nz", "Lx", "Ly", "Lz",
                 "x", "y", "z", "h", "Sn", "Sw", "qx", "qy", "qz", "is_source")
     try:
@@ -320,117 +214,256 @@ def _validate_npz_keys(loader, expected_npart):
                 return False, f"missing key '{k}'"
         if expected_npart is not None:
             for k in ("h", "Sn", "Sw", "qx", "qy", "qz"):
-                # Reading shape requires accessing the array, but NumPy lazy-
-                # loads from NPZ, so this is cheap.
                 shp = loader[k].shape
                 if shp[0] != expected_npart:
-                    return False, f"key '{k}' has shape {shp}, expected ({expected_npart},)"
+                    return False, (f"key '{k}' has shape {shp}, "
+                                   f"expected ({expected_npart},)")
     except _NPZ_ERRORS as e:
         return False, f"I/O error: {type(e).__name__}: {e}"
     return True, None
 
 
-def load_from_npz(snap_dir):
-    """Read NPZ snapshots in <snap_dir>/step_*.npz, skipping corrupt files."""
-    print(f"Reading NPZ snapshots from {snap_dir}/ ...", flush=True)
-    try:
-        files = sorted([fn for fn in os.listdir(snap_dir)
-                         if fn.startswith("step_") and fn.endswith(".npz")],
-                        key=_step_from_name)
-    except (OSError, FileNotFoundError) as e:
-        raise RuntimeError(f"Cannot list snapshots in {snap_dir}: {e}") from e
+def _read_h5_snapshot_file(path, expected_npart=None, want_napl_q=False):
+    """Open ONE per-snapshot HDF5 file and read its data.
 
-    if not files:
-        raise RuntimeError(f"No step_*.npz files in {snap_dir}/")
+    Returns (ok, payload_or_reason).  ok=True payload is a dict with
+    step, time, h, Sn, Sw, qx, qy, qz (and qxn,qyn,qzn if present).
+    ok=False payload is a string explaining the failure.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            ok, reason = _validate_h5_snapshot(f, expected_npart)
+            if not ok:
+                return False, reason
+            d = {"step": int(f.attrs["step"]),
+                 "time": float(f.attrs["time_s"]),
+                 "h":  f["h"][...],  "Sn": f["Sn"][...], "Sw": f["Sw"][...],
+                 "qx": f["qx"][...], "qy": f["qy"][...], "qz": f["qz"][...]}
+            if want_napl_q and all(k in f for k in ("qxn", "qyn", "qzn")):
+                d["qxn"] = f["qxn"][...]
+                d["qyn"] = f["qyn"][...]
+                d["qzn"] = f["qzn"][...]
+            return True, d
+    except _H5_ERRORS as e:
+        return False, f"I/O error: {type(e).__name__}: {e}"
+
+
+def _read_h5_snapshot_meta(path):
+    """Extract geometry/coords metadata from a single HDF5 snapshot file."""
+    try:
+        with h5py.File(path, "r") as f:
+            ok, reason = _validate_h5_snapshot(f, expected_npart=None)
+            if not ok:
+                return None, reason
+            Nx_ = int(f.attrs["Nx"]); Ny_ = int(f.attrs["Ny"]); Nz_ = int(f.attrs["Nz"])
+            meta = {
+                "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
+                "Lx": float(f.attrs["Lx"]),
+                "Ly": float(f.attrs["Ly"]),
+                "Lz": float(f.attrs["Lz"]),
+                "x": f["x"][...], "y": f["y"][...], "z": f["z"][...],
+                "is_source": f["is_source"][...].astype(bool),
+                "has_napl_q": all(k in f for k in ("qxn", "qyn", "qzn")),
+            }
+            return meta, None
+    except _H5_ERRORS as e:
+        return None, f"metadata read failed: {type(e).__name__}: {e}"
+
+
+def _read_npz_snapshot_file(path, expected_npart=None, want_napl_q=False):
+    """Open ONE per-snapshot NPZ file and read its data."""
+    try:
+        f = np.load(path)
+        ok, reason = _validate_npz_keys(f, expected_npart)
+        if not ok:
+            return False, reason
+        d = {"step": int(f["step"]), "time": float(f["time_s"]),
+             "h":  np.asarray(f["h"]),
+             "Sn": np.asarray(f["Sn"]),
+             "Sw": np.asarray(f["Sw"]),
+             "qx": np.asarray(f["qx"]),
+             "qy": np.asarray(f["qy"]),
+             "qz": np.asarray(f["qz"])}
+        if want_napl_q and all(k in f.files for k in ("qxn", "qyn", "qzn")):
+            d["qxn"] = np.asarray(f["qxn"])
+            d["qyn"] = np.asarray(f["qyn"])
+            d["qzn"] = np.asarray(f["qzn"])
+        return True, d
+    except _NPZ_ERRORS as e:
+        return False, f"I/O error: {type(e).__name__}: {e}"
+
+
+def _read_npz_snapshot_meta(path):
+    """Extract geometry metadata from a single NPZ snapshot file."""
+    try:
+        f0 = np.load(path)
+        ok, reason = _validate_npz_keys(f0, expected_npart=None)
+        if not ok:
+            return None, reason
+        Nx_ = int(f0["Nx"]); Ny_ = int(f0["Ny"]); Nz_ = int(f0["Nz"])
+        meta = {
+            "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
+            "Lx": float(f0["Lx"]), "Ly": float(f0["Ly"]), "Lz": float(f0["Lz"]),
+            "x": np.asarray(f0["x"]), "y": np.asarray(f0["y"]),
+            "z": np.asarray(f0["z"]),
+            "is_source": np.asarray(f0["is_source"]).astype(bool),
+            "has_napl_q": all(k in f0.files for k in ("qxn", "qyn", "qzn")),
+        }
+        return meta, None
+    except _NPZ_ERRORS as e:
+        return None, f"metadata read failed: {type(e).__name__}: {e}"
+
+
+def load_per_snapshot_files(snap_dir):
+    """Load all snapshots from a per-file directory.
+
+    Each snapshot is its own file: SNAP_DIR/step_NNNNNNNNNNNN.{h5,npz}.
+    If both .h5 and .npz exist for the same step, .h5 wins (HDF5 preferred).
+
+    Returns (meta, snaps) where:
+      - meta carries grid/domain info from the first valid snapshot
+      - snaps is a list of per-snapshot dicts in chronological order
+    Bad/corrupt files are reported and skipped, never crash the load.
+    """
+    print(f"Reading per-snapshot files from {snap_dir}/ ...", flush=True)
+    if not os.path.isdir(snap_dir):
+        raise RuntimeError(
+            f"Snapshot directory does not exist: {snap_dir}\n"
+            f"  Point --input at the directory containing step_*.h5 or step_*.npz files,\n"
+            f"  or at its parent (looks for ./snapshots inside)."
+        )
+
+    # Collect candidate files, preferring .h5 over .npz when both exist
+    by_step = {}
+    try:
+        all_entries = os.listdir(snap_dir)
+    except OSError as e:
+        raise RuntimeError(f"Cannot list {snap_dir}: {e}") from e
+
+    for entry in all_entries:
+        if not entry.startswith("step_"):
+            continue
+        if entry.endswith(".h5"):
+            step = _step_from_name(entry)
+            by_step[step] = ("h5", entry)
+        elif entry.endswith(".npz"):
+            step = _step_from_name(entry)
+            if step not in by_step:
+                # only add NPZ if no HDF5 already claimed this step
+                by_step[step] = ("npz", entry)
+
+    if not by_step:
+        raise RuntimeError(
+            f"No step_*.h5 or step_*.npz files in {snap_dir}.\n"
+            f"  If you have a legacy single-file HDF5 snapshot, that format is no\n"
+            f"  longer supported (it caused bus errors on Lustre at large sizes).\n"
+            f"  The simulation now writes one HDF5 file per snapshot."
+        )
+
+    steps_sorted = sorted(by_step.keys())
+    print(f"  Found {len(steps_sorted)} candidate snapshot file(s)")
 
     skipped = []
     meta = None
 
-    # Find first valid file for metadata
-    for fname in files:
-        path = os.path.join(snap_dir, fname)
-        try:
-            f0 = np.load(path)
-            ok, reason = _validate_npz_keys(f0, expected_npart=None)
-            if not ok:
-                skipped.append((fname, reason))
-                continue
-            Nx_ = int(f0["Nx"]); Ny_ = int(f0["Ny"]); Nz_ = int(f0["Nz"])
-            meta = {
-                "Nx": Nx_, "Ny": Ny_, "Nz": Nz_,
-                "Lx": float(f0["Lx"]), "Ly": float(f0["Ly"]), "Lz": float(f0["Lz"]),
-                "x": np.asarray(f0["x"]), "y": np.asarray(f0["y"]),
-                "z": np.asarray(f0["z"]),
-                "is_source": np.asarray(f0["is_source"]).astype(bool),
-                "has_napl_q": all(k in f0.files for k in ("qxn", "qyn", "qzn")),
-            }
-            break
-        except _NPZ_ERRORS as e:
-            skipped.append((fname, f"metadata read failed: {type(e).__name__}: {e}"))
+    # Pass 1: find first valid file for metadata
+    for step in steps_sorted:
+        fmt, name = by_step[step]
+        path = os.path.join(snap_dir, name)
+        if fmt == "h5":
+            m, reason = _read_h5_snapshot_meta(path)
+        else:
+            m, reason = _read_npz_snapshot_meta(path)
+        if m is None:
+            skipped.append((name, reason))
             continue
+        meta = m
+        break
 
     if meta is None:
         raise RuntimeError(
-            f"All {len(files)} NPZ snapshot files in {snap_dir} are unreadable.\n"
+            f"All {len(steps_sorted)} snapshot files in {snap_dir} are unreadable.\n"
             f"  First failures: {skipped[:3]}"
         )
 
     expected_npart = meta["Nx"] * meta["Ny"] * meta["Nz"]
-    files_subset = files[::args.skip]
+    already_failed = {name for name, _ in skipped}
+
+    # Apply --skip subsampling
+    steps_subset = steps_sorted[::args.skip]
     snaps = []
 
-    # Files that already failed metadata search are skipped
-    already_failed = {fname for fname, _ in skipped}
-
-    for fname in files_subset:
-        if fname in already_failed:
+    # Pass 2: read each snapshot, skipping bad ones
+    for step in steps_subset:
+        fmt, name = by_step[step]
+        if name in already_failed:
             continue
-        path = os.path.join(snap_dir, fname)
-        try:
-            f = np.load(path)
-            ok, reason = _validate_npz_keys(f, expected_npart)
-            if not ok:
-                skipped.append((fname, reason))
-                continue
-            d = {"step": int(f["step"]), "time": float(f["time_s"]),
-                 "h":  np.asarray(f["h"]),
-                 "Sn": np.asarray(f["Sn"]),
-                 "Sw": np.asarray(f["Sw"]),
-                 "qx": np.asarray(f["qx"]),
-                 "qy": np.asarray(f["qy"]),
-                 "qz": np.asarray(f["qz"])}
-            if meta["has_napl_q"] and all(k in f.files for k in ("qxn", "qyn", "qzn")):
-                d["qxn"] = np.asarray(f["qxn"])
-                d["qyn"] = np.asarray(f["qyn"])
-                d["qzn"] = np.asarray(f["qzn"])
-            snaps.append(d)
-        except _NPZ_ERRORS as e:
-            skipped.append((fname, f"read failed: {type(e).__name__}: {e}"))
-            continue
+        path = os.path.join(snap_dir, name)
+        if fmt == "h5":
+            ok, payload = _read_h5_snapshot_file(path, expected_npart,
+                                                  want_napl_q=meta["has_napl_q"])
+        else:
+            ok, payload = _read_npz_snapshot_file(path, expected_npart,
+                                                   want_napl_q=meta["has_napl_q"])
+        if ok:
+            snaps.append(payload)
+        else:
+            skipped.append((name, payload))   # payload is the reason string
 
     if skipped:
-        print(f"  WARNING: skipped {len(skipped)} unreadable NPZ file(s):")
-        for fname, reason in skipped[:5]:
-            print(f"    - {fname}: {reason}")
+        print(f"  WARNING: skipped {len(skipped)} unreadable snapshot file(s):")
+        for name, reason in skipped[:5]:
+            print(f"    - {name}: {reason}")
         if len(skipped) > 5:
             print(f"    ... and {len(skipped) - 5} more")
+        print(f"  Likely cause: incomplete rsync transfer, partial write, "
+              f"or file corruption.")
 
     if len(snaps) == 0:
         raise RuntimeError(
-            f"No usable NPZ snapshots in {snap_dir} after skipping "
-            f"{len(skipped)} bad ones."
+            f"No usable snapshots in {snap_dir} after skipping {len(skipped)} bad ones."
         )
 
     return meta, snaps
 
 
-# Try HDF5 first, fall back to NPZ directory
+# Resolve --input to a snapshot directory.
+# The simulation writes per-snapshot files to $OUTDIR/snapshots/, so --input
+# can be either that snapshots/ directory directly, or the run's --outdir.
+def _resolve_snap_dir(input_path):
+    # Legacy single-file HDF5 is no longer supported
+    if os.path.isfile(input_path) and input_path.endswith(".h5"):
+        sys.exit(
+            f"ERROR: --input points at a single HDF5 file ({input_path}).\n"
+            f"  This single-file format is no longer supported; the simulation\n"
+            f"  now writes one file per snapshot.  Point --input at the\n"
+            f"  snapshots/ directory containing step_*.h5 files."
+        )
+    if not os.path.isdir(input_path):
+        sys.exit(f"ERROR: --input directory does not exist: {input_path}")
+
+    # If the path contains step_*.{h5,npz} files directly, use it
+    import glob as _g
+    direct_h5  = _g.glob(os.path.join(input_path, "step_*.h5"))
+    direct_npz = _g.glob(os.path.join(input_path, "step_*.npz"))
+    if direct_h5 or direct_npz:
+        return input_path
+    # Otherwise look for a snapshots/ subdir
+    sub = os.path.join(input_path, "snapshots")
+    if os.path.isdir(sub):
+        sub_h5  = _g.glob(os.path.join(sub, "step_*.h5"))
+        sub_npz = _g.glob(os.path.join(sub, "step_*.npz"))
+        if sub_h5 or sub_npz:
+            return sub
+    sys.exit(
+        f"ERROR: no per-snapshot files found at {input_path} or "
+        f"{input_path}/snapshots/.\n  Expected step_*.h5 or step_*.npz files."
+    )
+
+snap_dir = _resolve_snap_dir(args.input)
+
 try:
-    if HAS_H5 and os.path.exists(args.input):
-        meta, snaps = load_from_hdf5(args.input)
-    else:
-        snap_dir = os.path.join(os.path.dirname(args.input) or ".", "snapshots")
-        meta, snaps = load_from_npz(snap_dir)
+    meta, snaps = load_per_snapshot_files(snap_dir)
 except Exception as e:
     print(f"ERROR loading snapshots: {e}")
     sys.exit(1)

@@ -78,7 +78,7 @@ _g_src.add_argument("--sn-source", type=float, default=0.80,
 _g_time = _parser.add_argument_group("Time integration")
 _g_time.add_argument("--n-steps", type=int, default=2000,
                       help="Maximum number of time steps")
-_g_time.add_argument("--cfl", type=float, default=0.1, help="CFL factor for stable dt")
+_g_time.add_argument("--cfl", type=float, default=0.25, help="CFL factor for stable dt")
 
 # --- I/O ---
 _g_io = _parser.add_argument_group("I/O cadence")
@@ -97,7 +97,8 @@ _g_path = _parser.add_argument_group("Output paths")
 _g_path.add_argument("--outdir", type=str, default=".",
                       help="Directory for HDF5/NPZ snapshots, checkpoints, figures")
 _g_path.add_argument("--snapshot-file", type=str, default="sph_napl_snapshots.h5",
-                      help="HDF5 snapshot filename (relative to --outdir)")
+                      help="DEPRECATED, ignored. Snapshots now go to OUTDIR/snapshots/ "
+                           "as one file per step (step_NNNNNNNNNNNN.h5 or .npz).")
 
 # --- GPU-specific tuning ---
 _g_gpu = _parser.add_argument_group("GPU tuning")
@@ -205,7 +206,7 @@ m_vG    = 1.0 - 1.0 / n_vG                    # Van Genuchten m
 g_a     = gamma_w / p_caw0                     # alpha_vG  [1/m]
 
 S_sat   = 1.0
-S_res   = 0.02
+S_res   = 0.045
 g_l     = 0.5          # Mualem pore-connectivity parameter
 
 # Specific storage  (paper Eq. 30)
@@ -1853,59 +1854,68 @@ except ImportError:
     HAS_H5 = False
     print("WARNING: h5py not available - HDF5 snapshots disabled.")
 
-hdf5_path = os.path.join(OUTPUT_DIR, args.snapshot_file)
+hdf5_path = os.path.join(OUTPUT_DIR, args.snapshot_file)  # kept for compat (unused)
 
 SNAP_DIR = os.path.join(OUTPUT_DIR, "snapshots")
 
 def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
                   qx, qy, qz, qxn, qyn, qzn):
-    """Save snapshot — HDF5 if available, else individual NPZ files.
+    """Save one snapshot to its OWN file: snapshots/step_NNNNNNNNNNNN.{h5,npz}.
+
+    One file per snapshot avoids the bus-error / metadata-cache problems
+    encountered with single multi-GB HDF5 files on parallel filesystems
+    (Lustre/GPFS). Each file is self-contained and independently readable.
+
+    The `fname` argument is kept for legacy interface compatibility but
+    is ignored — the actual filename is derived from the step number.
+
     qx,qy,qz   : water Darcy velocity components
     qxn,qyn,qzn: NAPL  Darcy velocity components
     """
     Sw = compute_Sw_3ph(h_field, Sn_field)
+    os.makedirs(SNAP_DIR, exist_ok=True)
 
     if HAS_H5:
-        mode = "a" if os.path.exists(fname) else "w"
-        with h5py.File(fname, mode) as f:
-            grp_name = f"step_{step:012d}"
-            if grp_name in f:
-                del f[grp_name]
-            grp = f.create_group(grp_name)
-            grp.attrs["step"]   = step
-            grp.attrs["time_s"] = t
-            grp.attrs["Nx"]     = Nx
-            grp.attrs["Ny"]     = Ny
-            grp.attrs["Nz"]     = Nz
-            grp.attrs["Lx"]     = Lx
-            grp.attrs["Ly"]     = Ly
-            grp.attrs["Lz"]     = Lz
-            grp.attrs["k_sat"]  = k_sat
-            grp.attrs["H_u"]    = H_u
-            grp.attrs["H_d"]    = H_d
+        path = os.path.join(SNAP_DIR, f"step_{step:012d}.h5")
+        # Write to a tmp file then atomic-rename so partial writes don't
+        # leave a half-written file under the canonical name.
+        tmp_path = path + ".tmp"
+        with h5py.File(tmp_path, "w") as f:
+            # Run + snapshot metadata at ROOT level (no group nesting)
+            f.attrs["step"]   = step
+            f.attrs["time_s"] = t
+            f.attrs["Nx"]     = Nx
+            f.attrs["Ny"]     = Ny
+            f.attrs["Nz"]     = Nz
+            f.attrs["Lx"]     = Lx
+            f.attrs["Ly"]     = Ly
+            f.attrs["Lz"]     = Lz
+            f.attrs["k_sat"]  = k_sat
+            f.attrs["H_u"]    = H_u
+            f.attrs["H_d"]    = H_d
 
-            grp.create_dataset("x",    data=xp)
-            grp.create_dataset("y",    data=yp)
-            grp.create_dataset("z",    data=zp)
-            grp.create_dataset("h",    data=h_field)
-            grp.create_dataset("H",    data=h_field + zp)
-            grp.create_dataset("Sn",   data=Sn_field)
-            grp.create_dataset("Sw",   data=Sw)
-            grp.create_dataset("kw",   data=compute_kw_3ph(h_field, Sn_field))
-            grp.create_dataset("kn",   data=compute_kn_field(h_field, Sn_field))
-            grp.create_dataset("dhdt", data=dhdt)
-            grp.create_dataset("dSndt", data=dSndt)
-            grp.create_dataset("qx",   data=qx)
-            grp.create_dataset("qy",   data=qy)
-            grp.create_dataset("qz",   data=qz)
-            grp.create_dataset("qxn",  data=qxn)
-            grp.create_dataset("qyn",  data=qyn)
-            grp.create_dataset("qzn",  data=qzn)
-            grp.create_dataset("ptype", data=ptype)
-            grp.create_dataset("is_source", data=is_source.astype(np.int8))
+            # Per-particle datasets at ROOT level
+            f.create_dataset("x",    data=xp)
+            f.create_dataset("y",    data=yp)
+            f.create_dataset("z",    data=zp)
+            f.create_dataset("h",    data=h_field)
+            f.create_dataset("H",    data=h_field + zp)
+            f.create_dataset("Sn",   data=Sn_field)
+            f.create_dataset("Sw",   data=Sw)
+            f.create_dataset("kw",   data=compute_kw_3ph(h_field, Sn_field))
+            f.create_dataset("kn",   data=compute_kn_field(h_field, Sn_field))
+            f.create_dataset("dhdt", data=dhdt)
+            f.create_dataset("dSndt", data=dSndt)
+            f.create_dataset("qx",   data=qx)
+            f.create_dataset("qy",   data=qy)
+            f.create_dataset("qz",   data=qz)
+            f.create_dataset("qxn",  data=qxn)
+            f.create_dataset("qyn",  data=qyn)
+            f.create_dataset("qzn",  data=qzn)
+            f.create_dataset("ptype", data=ptype)
+            f.create_dataset("is_source", data=is_source.astype(np.int8))
+        os.replace(tmp_path, path)
     else:
-        # NPZ fallback: one file per snapshot in snapshots/ directory
-        os.makedirs(SNAP_DIR, exist_ok=True)
         path = os.path.join(SNAP_DIR, f"step_{step:012d}.npz")
         np.savez_compressed(path,
             step=step, time_s=t, Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
@@ -1919,8 +1929,8 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
             qxn=qxn, qyn=qyn, qzn=qzn,
             ptype=ptype, is_source=is_source.astype(np.int8))
 
-# NOTE: snapshot file is NOT deleted on restart — new groups are appended
-# so the full time history is preserved across SLURM job submissions.
+# NOTE: each snapshot is now an INDEPENDENT FILE in SNAP_DIR. Restart logic
+# removes future-of-checkpoint files via filesystem unlink — no h5repack needed.
 
 
 # ======================================================================
@@ -2120,50 +2130,35 @@ if ckpt is not None:
     napl_mass_nosrc_log = list(ckpt["napl_mass_nosrc_log"])
 
     # --- Purge stale data from future of the checkpoint ---
-    # If a previous run wrote snapshots/checkpoints past the checkpoint
-    # step before being killed, those are from a trajectory that will be
-    # overwritten.  Remove them now to avoid an inconsistent history.
+    # With one-file-per-snapshot, this is a simple filesystem unlink:
+    # delete any step_NNN.{h5,npz} file or ckpt_NNN.{h5,npz} file whose
+    # step number is greater than the checkpoint we just restored from.
     ckpt_step = int(ckpt["step"])
-
-    # Purge stale HDF5 snapshot groups
-    if HAS_H5 and os.path.exists(hdf5_path):
-        n_purged = 0
-        with h5py.File(hdf5_path, "a") as f:
-            stale = [k for k in f.keys()
-                     if k.startswith("step_")
-                     and int(k.split("_")[1]) > ckpt_step]
-            for k in stale:
-                del f[k]
-                n_purged += 1
-        if n_purged > 0:
-            print(f"  Purged {n_purged} stale snapshot(s) "
-                  f"(step > {ckpt_step}) from {hdf5_path}")
-            # Repack to reclaim dead space left by deleted groups
-            import shutil, subprocess
-            tmp_path = hdf5_path + ".repack"
-            try:
-                result = subprocess.run(
-                    ["h5repack", hdf5_path, tmp_path],
-                    capture_output=True, timeout=120)
-                if result.returncode == 0:
-                    shutil.move(tmp_path, hdf5_path)
-                    print(f"  Repacked {hdf5_path} (dead space reclaimed)")
-                else:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-    # Purge stale checkpoint files past the restart point
     import glob
+
+    # Stale snapshot files
+    n_snap = 0
+    for pat in ["step_*.h5", "step_*.npz"]:
+        for s_path in glob.glob(os.path.join(SNAP_DIR, pat)):
+            base = os.path.basename(s_path)
+            s_step = int(base.split("_")[1].split(".")[0])
+            if s_step > ckpt_step:
+                os.remove(s_path)
+                n_snap += 1
+    if n_snap > 0:
+        print(f"  Purged {n_snap} stale snapshot file(s) (step > {ckpt_step})")
+
+    # Stale checkpoint files
+    n_ckpt = 0
     for pat in ["ckpt_*.h5", "ckpt_*.npz"]:
         for cp_path in glob.glob(os.path.join(CKPT_DIR, pat)):
             base = os.path.basename(cp_path)
             cp_step = int(base.split("_")[1].split(".")[0])
             if cp_step > ckpt_step:
                 os.remove(cp_path)
-                print(f"  Removed stale checkpoint: {base}")
+                n_ckpt += 1
+    if n_ckpt > 0:
+        print(f"  Removed {n_ckpt} stale checkpoint file(s) (step > {ckpt_step})")
 
 else:
     start_step = 1
@@ -2573,7 +2568,9 @@ print(f"  k_sat (water)                 = {k_sat:.6e} m/s")
 print(f"  k_sat (NAPL)                  = {k_sat_n:.6e} m/s")
 print(f"  Expected q_w ~ k_sat*dH/Lx    = {q_expected:.6e} m/s")
 if HAS_H5:
-    print(f"  HDF5 snapshots                = {hdf5_path}")
+    print(f"  HDF5 snapshots                = {SNAP_DIR}/  (one file per step)")
+else:
+    print(f"  NPZ snapshots                 = {SNAP_DIR}/  (one file per step)")
 print(f"  Checkpoints                   = {CKPT_DIR}/")
 print(f"{'='*70}")
 
