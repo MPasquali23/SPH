@@ -28,6 +28,9 @@ the snapshots/ subdirectory in that case).
 import argparse
 import os
 import sys
+import shutil
+import subprocess
+import tempfile
 import numpy as np
 
 import matplotlib
@@ -94,6 +97,24 @@ def format_time(t_seconds):
     return f"{minutes}m {seconds:02d}s"
 
 
+def format_dd_hh_mm_ss(t_seconds):
+    """Format a physical time (in seconds) as 'dd:hh:mm:ss'.
+    Always uses fixed 4-field format, suitable for static-figure panel
+    titles where uniform width across panels is desirable.
+
+    Sub-second times are shown as '00:00:00:00.xxxx' so we don't lose
+    precision for early-time panels.
+    """
+    if t_seconds < 1.0 and t_seconds > 0:
+        # Keep sub-second precision visible
+        return f"00:00:00:00 ({t_seconds:.2e} s)"
+    total_s = int(round(t_seconds))
+    days,  rem = divmod(total_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{days:02d}:{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -152,26 +173,22 @@ parser.add_argument("--pix-fmt", choices=["yuv420p", "yuv444p"], default="yuv420
                          "(sharper colored particles) but is rejected by some players "
                          "(notably old QuickTime / iOS Safari). Use yuv444p for "
                          "scientific archival, yuv420p for sharing.")
-args = parser.parse_args()
-
-# Resolve --workers auto setting
-import multiprocessing as _mp
-if args.workers == 0:
-    _N_WORKERS = max(1, _mp.cpu_count() - 1)
-else:
-    _N_WORKERS = max(1, args.workers)
-print(f"Frame rendering: {'parallel' if _N_WORKERS > 1 else 'serial'} "
-      f"({_N_WORKERS} worker{'s' if _N_WORKERS > 1 else ''})")
-
-os.makedirs(args.outdir, exist_ok=True)
-
-if not HAS_H5:
-    print("NOTE: h5py not available — only NPZ snapshots can be read.")
+parser.add_argument("--mp-start-method", choices=["spawn", "fork", "forkserver"],
+                    default="spawn",
+                    help="Multiprocessing start method for workers. Default 'spawn' "
+                         "is safest — each worker is a fresh Python process. 'fork' "
+                         "is faster to start but copies the parent's memory state, "
+                         "which can corrupt thread-using libraries (HDF5, OpenMP, "
+                         "matplotlib) and cause bus errors / segfaults on HPC. "
+                         "Use 'fork' only if you've verified it works on your "
+                         "cluster and need the faster startup.")
 
 
-# ======================================================================
-# LOAD SNAPSHOTS  (HDF5 if available, else NPZ directory)
-# ======================================================================
+# ====================================================================
+# FUNCTION DEFINITIONS (at module scope so spawn-mode workers can re-import
+# them without re-running the runtime work)
+# ====================================================================
+
 def _validate_h5_snapshot(group, expected_npart):
     """Return (ok, reason) for whether an HDF5 snapshot group is fully readable.
 
@@ -314,18 +331,40 @@ def _read_npz_snapshot_meta(path):
         return None, f"metadata read failed: {type(e).__name__}: {e}"
 
 
-def load_per_snapshot_files(snap_dir):
-    """Load all snapshots from a per-file directory.
+def _read_step_time_only(path, fmt):
+    """Read just (step, time_s) from a snapshot file. Cheap — does not
+    touch any per-particle data. Returns (step, time) or (None, None) on
+    failure."""
+    try:
+        if fmt == "h5":
+            with h5py.File(path, "r") as f:
+                return int(f.attrs["step"]), float(f.attrs["time_s"])
+        else:
+            with np.load(path) as ld:
+                return int(ld["step"]), float(ld["time_s"])
+    except (_H5_ERRORS if fmt == "h5" else _NPZ_ERRORS) as e:
+        return None, None
+    except Exception:
+        return None, None
 
-    Each snapshot is its own file: SNAP_DIR/step_NNNNNNNNNNNN.{h5,npz}.
-    If both .h5 and .npz exist for the same step, .h5 wins (HDF5 preferred).
 
-    Returns (meta, snaps) where:
-      - meta carries grid/domain info from the first valid snapshot
-      - snaps is a list of per-snapshot dicts in chronological order
-    Bad/corrupt files are reported and skipped, never crash the load.
+def scan_snapshots(snap_dir, skip=1):
+    """Scan a per-snapshot directory and return a lightweight catalog.
+
+    No per-particle data is loaded — only file paths, step numbers, and
+    times. Use read_one_snapshot(path, fmt, ...) to load actual data on
+    demand inside workers.
+
+    Returns (meta, frames):
+      - meta: dict with grid/domain info and positions, from the FIRST
+        valid snapshot. ~140 MB at 1M particles — only loaded once.
+      - frames: list of dicts in chronological order:
+          {"step": int, "time": float, "path": str, "fmt": "h5"|"npz"}
+        No per-particle arrays. ~100 bytes per entry. Cheap.
+
+    Bad/corrupt files are reported and skipped.
     """
-    print(f"Reading per-snapshot files from {snap_dir}/ ...", flush=True)
+    print(f"Scanning per-snapshot files in {snap_dir}/ ...", flush=True)
     if not os.path.isdir(snap_dir):
         raise RuntimeError(
             f"Snapshot directory does not exist: {snap_dir}\n"
@@ -333,7 +372,6 @@ def load_per_snapshot_files(snap_dir):
             f"  or at its parent (looks for ./snapshots inside)."
         )
 
-    # Collect candidate files, preferring .h5 over .npz when both exist
     by_step = {}
     try:
         all_entries = os.listdir(snap_dir)
@@ -349,7 +387,6 @@ def load_per_snapshot_files(snap_dir):
         elif entry.endswith(".npz"):
             step = _step_from_name(entry)
             if step not in by_step:
-                # only add NPZ if no HDF5 already claimed this step
                 by_step[step] = ("npz", entry)
 
     if not by_step:
@@ -366,7 +403,7 @@ def load_per_snapshot_files(snap_dir):
     skipped = []
     meta = None
 
-    # Pass 1: find first valid file for metadata
+    # Pass 1: find first valid file for metadata (grid + positions)
     for step in steps_sorted:
         fmt, name = by_step[step]
         path = os.path.join(snap_dir, name)
@@ -386,29 +423,22 @@ def load_per_snapshot_files(snap_dir):
             f"  First failures: {skipped[:3]}"
         )
 
-    expected_npart = meta["Nx"] * meta["Ny"] * meta["Nz"]
     already_failed = {name for name, _ in skipped}
 
-    # Apply --skip subsampling
-    steps_subset = steps_sorted[::args.skip]
-    snaps = []
-
-    # Pass 2: read each snapshot, skipping bad ones
+    # Pass 2: build lightweight catalog (step, time, path, fmt) per frame.
+    # Each entry reads only the (step, time_s) attrs — no array data.
+    steps_subset = steps_sorted[::skip]
+    frames = []
     for step in steps_subset:
         fmt, name = by_step[step]
         if name in already_failed:
             continue
         path = os.path.join(snap_dir, name)
-        if fmt == "h5":
-            ok, payload = _read_h5_snapshot_file(path, expected_npart,
-                                                  want_napl_q=meta["has_napl_q"])
-        else:
-            ok, payload = _read_npz_snapshot_file(path, expected_npart,
-                                                   want_napl_q=meta["has_napl_q"])
-        if ok:
-            snaps.append(payload)
-        else:
-            skipped.append((name, payload))   # payload is the reason string
+        s, t = _read_step_time_only(path, fmt)
+        if s is None:
+            skipped.append((name, "couldn't read step/time attrs"))
+            continue
+        frames.append({"step": s, "time": t, "path": path, "fmt": fmt})
 
     if skipped:
         print(f"  WARNING: skipped {len(skipped)} unreadable snapshot file(s):")
@@ -419,12 +449,72 @@ def load_per_snapshot_files(snap_dir):
         print(f"  Likely cause: incomplete rsync transfer, partial write, "
               f"or file corruption.")
 
-    if len(snaps) == 0:
+    if len(frames) == 0:
         raise RuntimeError(
             f"No usable snapshots in {snap_dir} after skipping {len(skipped)} bad ones."
         )
 
-    return meta, snaps
+    # ─── Detect particle ordering and compute lex permutation ──────────
+    # Particles in the GPU script are reordered with Z-order (Morton curve)
+    # for memory coalescence. CPU/MPI snapshots are in lex order.
+    # We always want lex order downstream (so 1D->3D reshape works for slice
+    # rendering). Detect the order from positions and compute a permutation
+    # that puts particles in lex order: idx_lex = i*Ny*Nz + j*Nz + k.
+    Nx_m = int(meta["Nx"]); Ny_m = int(meta["Ny"]); Nz_m = int(meta["Nz"])
+    Lx_m = float(meta["Lx"]); Ly_m = float(meta["Ly"]); Lz_m = float(meta["Lz"])
+    dx_m = Lx_m / (Nx_m - 1)
+    dy_m = Ly_m / (Ny_m - 1)
+    dz_m = Lz_m / (Nz_m - 1)
+    ii = np.round(meta["x"] / dx_m).astype(np.int64)
+    jj = np.round(meta["y"] / dy_m).astype(np.int64)
+    kk = np.round(meta["z"] / dz_m).astype(np.int64)
+    lex_index = ii * (Ny_m * Nz_m) + jj * Nz_m + kk
+    perm = np.argsort(lex_index, kind="stable")
+    identity = np.arange(len(perm), dtype=perm.dtype)
+    if np.array_equal(perm, identity):
+        meta["lex_perm"] = None
+        print(f"  Particle order: lexicographic (no reordering needed)")
+    else:
+        meta["lex_perm"] = perm
+        print(f"  Particle order: non-lex (e.g. Z-order from GPU runs); "
+              f"will apply permutation to restore lex order on read")
+        # Apply to meta arrays so downstream code sees lex-ordered positions
+        meta["x"] = meta["x"][perm]
+        meta["y"] = meta["y"][perm]
+        meta["z"] = meta["z"][perm]
+        meta["is_source"] = meta["is_source"][perm]
+
+    return meta, frames
+
+
+def read_one_snapshot(path, fmt, expected_npart, want_napl_q, lex_perm=None):
+    """Read one snapshot's data from disk. Returns the snap dict directly
+    (the data is yours to use and discard). Raises on I/O failure with a
+    descriptive message; the caller decides how to handle it.
+
+    If lex_perm is provided (non-None), the read arrays are reordered by
+    that permutation before being returned. Used to convert GPU Z-ordered
+    snapshots into lex order so 1D→3D reshape works correctly.
+
+    This is the function workers call. After it returns, the snap dict's
+    arrays are referenced only by the worker — when the worker function
+    returns, they go out of scope and are garbage-collected promptly.
+    """
+    if fmt == "h5":
+        ok, payload = _read_h5_snapshot_file(path, expected_npart, want_napl_q)
+    else:
+        ok, payload = _read_npz_snapshot_file(path, expected_npart, want_napl_q)
+    if not ok:
+        raise RuntimeError(f"Failed to read {path}: {payload}")
+    if lex_perm is not None:
+        # Apply lex permutation to all per-particle arrays in the payload.
+        # Keys whose values have shape (N_part,) are reordered; scalar keys
+        # (step, time) are passed through.
+        n = expected_npart
+        for k, v in list(payload.items()):
+            if isinstance(v, np.ndarray) and v.ndim >= 1 and v.shape[0] == n:
+                payload[k] = v[lex_perm]
+    return payload
 
 
 # Resolve --input to a snapshot directory.
@@ -460,72 +550,9 @@ def _resolve_snap_dir(input_path):
         f"{input_path}/snapshots/.\n  Expected step_*.h5 or step_*.npz files."
     )
 
-snap_dir = _resolve_snap_dir(args.input)
-
-try:
-    meta, snaps = load_per_snapshot_files(snap_dir)
-except Exception as e:
-    print(f"ERROR loading snapshots: {e}")
-    sys.exit(1)
-
-Nx = int(meta["Nx"]); Ny = int(meta["Ny"]); Nz = int(meta["Nz"])
-Lx = float(meta["Lx"]); Ly = float(meta["Ly"]); Lz = float(meta["Lz"])
-x_flat = meta["x"]; y_flat = meta["y"]; z_flat = meta["z"]
-is_source_flat = meta["is_source"]
-has_napl_q = meta["has_napl_q"]
-
-print(f"  Grid: {Nx} x {Ny} x {Nz}    Domain: {Lx} x {Ly} x {Lz} m")
-print(f"  Loaded {len(snaps)} frames.   t = [{snaps[0]['time']:.1f}, {snaps[-1]['time']:.1f}] s")
-if not has_napl_q:
-    print("  NOTE: NAPL velocity not in snapshots — red NAPL streamlines will be skipped.")
-
-
-# ======================================================================
-# GEOMETRY: reshape, infer source location
-# ======================================================================
 def to3d(arr):
     return arr.reshape(Nx, Ny, Nz)
 
-X3 = to3d(x_flat); Y3 = to3d(y_flat); Z3 = to3d(z_flat)
-src3 = to3d(is_source_flat)
-
-dx = Lx / (Nx - 1)
-dy = Ly / (Ny - 1)
-dz = Lz / (Nz - 1)
-
-src_xs = X3[src3]; src_ys = Y3[src3]; src_zs = Z3[src3]
-if len(src_xs) == 0:
-    print("WARNING: is_source mask is empty — defaulting slice indices to grid centre")
-    SRC_X0 = SRC_X1 = 0.5 * Lx
-    SRC_Y0 = SRC_Y1 = 0.5 * Ly
-    SRC_Z0 = SRC_Z1 = 0.5 * Lz
-    ix_src = Nx // 2; iy_src = Ny // 2
-else:
-    SRC_X0, SRC_X1 = src_xs.min(), src_xs.max()
-    SRC_Y0, SRC_Y1 = src_ys.min(), src_ys.max()
-    SRC_Z0, SRC_Z1 = src_zs.min(), src_zs.max()
-    # Pad bbox by half a cell so the rectangle visually contains the source markers
-    SRC_X0 -= 0.5*dx; SRC_X1 += 0.5*dx
-    SRC_Y0 -= 0.5*dy; SRC_Y1 += 0.5*dy
-    SRC_Z0 -= 0.5*dz; SRC_Z1 += 0.5*dz
-    cx = 0.5 * (src_xs.min() + src_xs.max())
-    cy = 0.5 * (src_ys.min() + src_ys.max())
-    ix_src = max(0, min(int(round(cx / dx)), Nx - 1))
-    iy_src = max(0, min(int(round(cy / dy)), Ny - 1))
-
-print(f"  Source bbox  x=[{SRC_X0:.2f},{SRC_X1:.2f}]  "
-      f"y=[{SRC_Y0:.2f},{SRC_Y1:.2f}]  z=[{SRC_Z0:.2f},{SRC_Z1:.2f}]")
-print(f"  Slice indices: ix_src={ix_src} (x={X3[ix_src,0,0]:.2f}m), "
-      f"iy_src={iy_src} (y={Y3[0,iy_src,0]:.2f}m)")
-
-x_axis = X3[:, 0, 0]
-y_axis = Y3[0, :, 0]
-z_axis = Z3[0, 0, :]
-
-
-# ======================================================================
-# Helper functions
-# ======================================================================
 def saturations_from(Sw_flat, Sn_flat):
     """Return (Sw, Sn, Sa) as 3D arrays clipped to [0,1]."""
     Sw3 = to3d(np.clip(Sw_flat, 0.0, 1.0))
@@ -552,14 +579,6 @@ def slice_xz(field3, iy):  return field3[:, iy, :]   # (Nx, Nz)
 # ======================================================================
 # PLOT 1: animated XZ + YZ slice with RGB scatter and streamlines
 # ======================================================================
-print("\nBuilding Plot 1 (slice animation: particle scatter + streamlines) ...", flush=True)
-
-import shutil
-import subprocess
-import tempfile
-
-# ── Helpers used in BOTH serial and parallel paths ────────────────────
-
 def mask_low_speed(u, v, threshold_frac):
     """Return (u, v) with cells below threshold_frac * max(|v|) replaced by NaN.
     streamplot skips integration through NaN cells, so faint flow regions are
@@ -731,20 +750,28 @@ def _draw_plot1_into_axes(ax_yz, ax_xz, fig, snap, geom,
 
 
 def _render_frame_worker(task):
-    """Worker: build a fresh figure, render one frame, save PNG, close.
-    Top-level (picklable). All arguments come through `task`.
+    """Worker: open ONE snapshot file, render its frame to a PNG, close,
+    release memory, return.
+
+    Top-level (picklable). After this function returns, the snap dict's
+    arrays go out of scope inside this worker process and are garbage
+    collected.  Peak memory per worker is ~1 snapshot worth of data plus
+    matplotlib's rendering buffers.
     """
-    (idx, snap, geom, png_path, dpi, alpha_val,
-     stream_thresh, stream_density, stream_grid, draw_streamlines_flag) = task
-    # Each worker creates its own figure (matplotlib figures are NOT
-    # safe to share across processes).
+    (idx, path, fmt, expected_npart, want_napl_q, lex_perm, geom, png_path, dpi,
+     alpha_val, stream_thresh, stream_density, stream_grid,
+     draw_streamlines_flag) = task
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as _plt
+    import gc as _gc
+
+    # Read this frame's data on demand (the whole reason for streaming).
+    # lex_perm reorders Z-order GPU snapshots into lex order; None = no-op.
+    snap = read_one_snapshot(path, fmt, expected_npart, want_napl_q, lex_perm)
+
     fig, (ax_yz, ax_xz) = _plt.subplots(1, 2, figsize=(15, 7),
                                           constrained_layout=True)
-    # First draw to give axes a real bbox so marker_size_for would work.
-    # We don't recompute size here — geom carries the parent-computed values.
     setup_axes_plot1(ax_yz, ax_xz, geom)
     fig.canvas.draw()
     try:
@@ -754,47 +781,17 @@ def _render_frame_worker(task):
         fig.savefig(png_path, dpi=dpi)
     finally:
         _plt.close(fig)
+        # Explicitly drop refs and request GC before returning so the
+        # worker process's RSS settles between tasks.  Important for
+        # spawn-mode pools where the worker is reused for many frames.
+        del snap
+        _gc.collect()
     return idx
 
 
 # ── Compute marker sizes from a one-shot reference figure ───────────
 # (sizes depend on the actual rendered axis pixel extent, which depends
 # on figsize and DPI; both are the same in serial and parallel paths)
-_ref_fig, (_ref_yz, _ref_xz) = plt.subplots(1, 2, figsize=(15, 7),
-                                              constrained_layout=True)
-
-# Build the geom dict that travels everywhere (worker, serial path)
-Y_yz_full, Z_yz_full = np.meshgrid(y_axis, z_axis, indexing="ij")
-X_xz_full, Z_xz_full = np.meshgrid(x_axis, z_axis, indexing="ij")
-
-geom = {
-    "Nx": Nx, "Ny": Ny, "Nz": Nz,
-    "Lx": Lx, "Ly": Ly, "Lz": Lz,
-    "ix_src": ix_src, "iy_src": iy_src,
-    "x_axis": x_axis, "y_axis": y_axis, "z_axis": z_axis,
-    "SRC_X0": SRC_X0, "SRC_X1": SRC_X1,
-    "SRC_Y0": SRC_Y0, "SRC_Y1": SRC_Y1,
-    "SRC_Z0": SRC_Z0, "SRC_Z1": SRC_Z1,
-    "yz_y_flat": Y_yz_full.ravel(), "yz_z_flat": Z_yz_full.ravel(),
-    "xz_x_flat": X_xz_full.ravel(), "xz_z_flat": Z_xz_full.ravel(),
-    "size_yz": None, "size_xz": None,   # filled in next
-}
-setup_axes_plot1(_ref_yz, _ref_xz, geom)
-_ref_fig.canvas.draw()
-geom["size_yz"] = marker_size_for(_ref_yz, dy)
-geom["size_xz"] = marker_size_for(_ref_xz, dx)
-plt.close(_ref_fig)
-
-
-# ── Decide rendering path ────────────────────────────────────────────
-n_frames = len(snaps)
-out_path1_base = os.path.join(args.outdir, "anim_slices_rgb")
-saved = False
-
-# Check for ffmpeg availability — required for the parallel path
-_FFMPEG = shutil.which("ffmpeg")
-
-
 def _probe_ffmpeg_encoders(ffmpeg_path):
     """Return a set of available video encoder names from `ffmpeg -encoders`.
     Empty set on failure (caller should treat as "unknown, try anyway").
@@ -863,218 +860,718 @@ def _build_encoder_candidates(quality, pix_fmt):
 
 
 # Candidate (extension, codec, extra_args) triples in preference order.
-_ENCODER_CANDIDATES = _build_encoder_candidates(args.quality, args.pix_fmt)
-_use_parallel = (_N_WORKERS > 1) and (_FFMPEG is not None)
-if _N_WORKERS > 1 and _FFMPEG is None:
-    print(f"  WARNING: ffmpeg not found on PATH; falling back to serial mode")
+def _draw_plot2_into_axes(ax, snap, geom_p2):
+    """Render saturation profiles (Sw, Sn, Sa) vs z into a given axes.
+    Same drawing logic used by both the animation worker and the 4-panel
+    static figure. `snap` is one snapshot's data dict; geom_p2 carries
+    ix_src, iy_src, z_axis, Lz, x_axis, y_axis, Nx, Ny, Nz.
+    """
+    ix_src_ = geom_p2["ix_src"]; iy_src_ = geom_p2["iy_src"]
+    z_axis_ = geom_p2["z_axis"]; Lz_ = geom_p2["Lz"]
+    Nx_ = geom_p2["Nx"]; Ny_ = geom_p2["Ny"]; Nz_ = geom_p2["Nz"]
+    x_axis_ = geom_p2["x_axis"]; y_axis_ = geom_p2["y_axis"]
 
-if _use_parallel:
-    # ─── PARALLEL PATH ────────────────────────────────────────────────
-    # Render each frame to a PNG in a worker process, then have ffmpeg
-    # stitch them into an MP4. Roughly N_workers× faster than serial
-    # for streamplot-heavy frames.
-    with tempfile.TemporaryDirectory(prefix="sph_anim_", dir=args.outdir) as tmpdir:
-        tasks = []
-        for idx, snap in enumerate(snaps):
-            png_path = os.path.join(tmpdir, f"frame_{idx:06d}.png")
-            tasks.append((idx, snap, geom, png_path, args.dpi,
-                          args.alpha, args.stream_threshold, args.stream_density,
-                          args.stream_grid, not args.no_streamlines))
+    Sw3 = snap["Sw"].reshape(Nx_, Ny_, Nz_)
+    Sn3 = snap["Sn"].reshape(Nx_, Ny_, Nz_)
+    Sa3 = np.clip(1.0 - Sw3 - Sn3, 0.0, 1.0)
+    Sw_col = Sw3[ix_src_, iy_src_, :]
+    Sn_col = Sn3[ix_src_, iy_src_, :]
+    Sa_col = Sa3[ix_src_, iy_src_, :]
+    h_col  = snap["h"].reshape(Nx_, Ny_, Nz_)[ix_src_, iy_src_, :]
 
-        print(f"  Rendering {n_frames} frames with {_N_WORKERS} workers ...",
-              flush=True)
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        try:
-            ctx = _mp.get_context("fork")
-        except ValueError:
-            print(f"  NOTE: 'fork' start method unavailable; using 'spawn' "
-                  f"(slower worker startup)")
-            ctx = _mp.get_context("spawn")
-
-        import time as _time
-        _t_render_start = _time.time()
-        completed = 0
-        try:
-            with ProcessPoolExecutor(max_workers=_N_WORKERS,
-                                       mp_context=ctx) as pool:
-                futures = [pool.submit(_render_frame_worker, t) for t in tasks]
-                for fut in as_completed(futures):
-                    try:
-                        idx = fut.result()
-                        completed += 1
-                        if completed % max(1, n_frames // 10) == 0:
-                            elapsed = _time.time() - _t_render_start
-                            rate = completed / elapsed if elapsed > 0 else 0
-                            eta = (n_frames - completed) / rate if rate > 0 else 0
-                            print(f"    ... {completed}/{n_frames} frames "
-                                  f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
-                    except Exception as e:
-                        print(f"    WORKER FAILED: {type(e).__name__}: {e}")
-            _t_render = _time.time() - _t_render_start
-            print(f"  Rendered {completed}/{n_frames} frames in {_t_render:.1f}s "
-                  f"({completed/_t_render:.1f} fr/s)", flush=True)
-        except Exception as e:
-            print(f"  ERROR in parallel rendering: {e}; falling back to serial")
-            _use_parallel = False
-
-        if _use_parallel and completed > 0:
-            # ffmpeg stitch — try a chain of encoders, fall back through
-            # codecs and containers as needed.  The first one that actually
-            # produces a valid file wins.
-            available = _probe_ffmpeg_encoders(_FFMPEG)
-            if available:
-                # Filter the candidate list to encoders we know are present.
-                # If probing failed (empty set), try them all anyway — the
-                # `-encoders` listing is informational; some builds may still
-                # accept encoders that don't appear there.
-                candidates = [(c, e, a) for (c, e, a) in _ENCODER_CANDIDATES
-                              if c in available]
-                if not candidates:
-                    print(f"  WARNING: none of the preferred encoders are available "
-                          f"in this ffmpeg build. Trying mpeg4 as last resort.")
-                    candidates = [("mpeg4", "mp4", ["-q:v", "5"])]
-            else:
-                candidates = list(_ENCODER_CANDIDATES)
-
-            print(f"  Encoding video ({len(candidates)} encoder candidate"
-                  f"{'s' if len(candidates) > 1 else ''}) ...", flush=True)
-
-            input_pattern = os.path.join(tmpdir, "frame_%06d.png")
-            for codec, ext, extra in candidates:
-                out_path = out_path1_base + "." + ext
-                cmd = [_FFMPEG, "-y",
-                       "-framerate", str(args.fps),
-                       "-i", input_pattern,
-                       "-c:v", codec,
-                       *extra,
-                       "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                       out_path]
-                _t_enc = _time.time()
-                try:
-                    proc = subprocess.run(cmd, capture_output=True, text=True)
-                    _t_enc = _time.time() - _t_enc
-                    if proc.returncode == 0:
-                        print(f"  Saved {out_path}  "
-                              f"(codec={codec}, encode: {_t_enc:.1f}s)")
-                        saved = True
-                        break
-                    else:
-                        # Show only the last meaningful error line
-                        err_tail = proc.stderr.strip().splitlines()[-1] \
-                                   if proc.stderr.strip() else "(no stderr)"
-                        print(f"  encoder '{codec}' failed: {err_tail}")
-                except Exception as e:
-                    print(f"  encoder '{codec}' invocation failed: {e}")
-
-            if not saved:
-                print(f"  All ffmpeg encoder candidates failed; "
-                      f"will fall back to serial mode (which can write GIF).")
-
-if not saved:
-    # ─── SERIAL PATH (FuncAnimation) ──────────────────────────────────
-    # Either the user asked for serial, or parallel rendering failed.
-    # Falls back to FuncAnimation; supports both MP4 (via ffmpeg) and
-    # GIF (via Pillow) writers.
-    print(f"  Rendering {n_frames} frames serially ...", flush=True)
-    fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(15, 7),
-                                        constrained_layout=True)
-    setup_axes_plot1(ax1a, ax1b, geom)
-    fig1.canvas.draw()
-
-    def _animate(frame_idx):
-        _draw_plot1_into_axes(ax1a, ax1b, fig1, snaps[frame_idx], geom,
-                               args.alpha, args.stream_threshold, args.stream_density,
-                               args.stream_grid, not args.no_streamlines)
-
-    _draw_plot1_into_axes(ax1a, ax1b, fig1, snaps[0], geom,
-                           args.alpha, args.stream_threshold, args.stream_density,
-                           args.stream_grid, not args.no_streamlines)
-    anim1 = animation.FuncAnimation(fig1, _animate, frames=n_frames,
-                                      interval=1000//args.fps)
-    for ext, writer_name in [("mp4", "ffmpeg"), ("gif", "pillow")]:
-        try:
-            full = out_path1_base + "." + ext
-            anim1.save(full, writer=writer_name, fps=args.fps, dpi=args.dpi)
-            print(f"  Saved {full}")
-            saved = True
-            break
-        except Exception as e:
-            print(f"  ({writer_name} failed: {e})")
-    plt.close(fig1)
-
-if not saved:
-    print("  ERROR: could not save Plot 1 animation")
-
-
-
-# ======================================================================
-# PLOT 2: animated saturation profiles vs z at (x_src, y_src)
-# ======================================================================
-print("\nBuilding Plot 2 (saturation profiles animation) ...", flush=True)
-
-fig2, ax2 = plt.subplots(figsize=(7, 8), constrained_layout=True)
-
-
-def render_plot2_frame(snap):
-    ax2.clear()
-    Sw3, Sn3, Sa3 = saturations_from(snap["Sw"], snap["Sn"])
-    Sw_col = Sw3[ix_src, iy_src, :]
-    Sn_col = Sn3[ix_src, iy_src, :]
-    Sa_col = Sa3[ix_src, iy_src, :]
-    h_col  = to3d(snap["h"])[ix_src, iy_src, :]
-
-    ax2.plot(Sw_col, z_axis, "b-",  lw=2,    label=r"$S_w$ (water)")
-    ax2.plot(Sn_col, z_axis, "r-",  lw=2,    label=r"$S_n$ (NAPL)")
-    ax2.plot(Sa_col, z_axis, "g--", lw=1.5,  label=r"$S_a$ (air)")
+    ax.plot(Sw_col, z_axis_, "b-",  lw=2,    label=r"$S_w$ (water)")
+    ax.plot(Sn_col, z_axis_, "r-",  lw=2,    label=r"$S_n$ (NAPL)")
+    ax.plot(Sa_col, z_axis_, "g--", lw=1.5,  label=r"$S_a$ (air)")
 
     # Water-table elevation: linear-interpolate where h crosses 0
     sign_change = np.where(np.diff(np.sign(h_col)))[0]
     if len(sign_change) > 0:
         i0 = sign_change[0]; i1 = i0 + 1
         h0, h1 = h_col[i0], h_col[i1]
-        z0, z1 = z_axis[i0], z_axis[i1]
+        z0, z1 = z_axis_[i0], z_axis_[i1]
         if abs(h1 - h0) > 1e-30:
             z_wt = z0 - h0 * (z1 - z0) / (h1 - h0)
-            ax2.axhline(z_wt, color="cyan", ls=":", lw=1, alpha=0.7,
-                         label=f"WT  z={z_wt:.2f} m")
+            ax.axhline(z_wt, color="cyan", ls=":", lw=1, alpha=0.7,
+                        label=f"WT  z={z_wt:.2f} m")
 
-    ax2.set_xlabel("Saturation [-]")
-    ax2.set_ylabel("z [m]")
-    ax2.set_xlim(-0.05, 1.05)
-    ax2.set_ylim(0, Lz)
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc="upper right", fontsize=10)
-    ax2.set_title(
-        f"Saturation profiles at (x={x_axis[ix_src]:.2f}, y={y_axis[iy_src]:.2f}) m"
-        f"\nstep {snap['step']:>6d},  t = {format_time(snap['time'])}",
-        fontsize=11)
+    ax.set_xlabel("Saturation [-]")
+    ax.set_ylabel("z [m]")
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(0, Lz_)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
 
 
-def animate_plot2(frame_idx):
-    render_plot2_frame(snaps[frame_idx])
+def _render_plot2_frame_worker(task):
+    """Worker for Plot 2 (profile vs z): open one snapshot, render one PNG,
+    release memory, return. Streaming pattern."""
+    (idx, path, fmt, expected_npart, want_napl_q, lex_perm,
+     geom_p2, png_path, dpi) = task
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    import gc as _gc
 
-print(f"  Rendering {len(snaps)} frames ...", flush=True)
-render_plot2_frame(snaps[0])
-anim2 = animation.FuncAnimation(fig2, animate_plot2, frames=len(snaps),
-                                  interval=1000//args.fps)
+    snap = read_one_snapshot(path, fmt, expected_npart, want_napl_q, lex_perm)
 
-out_path2 = os.path.join(args.outdir, "anim_profile_xy")
-saved = False
-for ext, writer_name in [("mp4", "ffmpeg"), ("gif", "pillow")]:
+    fig, ax = _plt.subplots(figsize=(7, 8), constrained_layout=True)
     try:
-        full = out_path2 + "." + ext
-        anim2.save(full, writer=writer_name, fps=args.fps, dpi=args.dpi)
-        print(f"  Saved {full}")
-        saved = True
-        break
+        _draw_plot2_into_axes(ax, snap, geom_p2)
+        x_ax = geom_p2["x_axis"]; y_ax = geom_p2["y_axis"]
+        ix_s = geom_p2["ix_src"]; iy_s = geom_p2["iy_src"]
+        ax.set_title(
+            f"Saturation profiles at (x={x_ax[ix_s]:.2f}, y={y_ax[iy_s]:.2f}) m"
+            f"\nstep {snap['step']:>6d},  t = {format_time(snap['time'])}",
+            fontsize=11)
+        fig.savefig(png_path, dpi=dpi)
+    finally:
+        _plt.close(fig)
+        del snap
+        _gc.collect()
+    return idx
+
+
+# Build geom dict for Plot 2 (lightweight — no per-particle data)
+def _pick_panel_indices(n):
+    """Pick 4 frame indices: first, 1/3, 2/3, last. Works for any n>=1."""
+    if n <= 1:
+        return [0]
+    if n == 2:
+        return [0, 1]
+    if n == 3:
+        return [0, 1, 2]
+    return [0, n // 3, (2 * n) // 3, n - 1]
+
+
+
+
+# ====================================================================
+# MAIN ENTRY POINT (everything runtime-side lives inside main() so that
+# spawn-mode worker re-imports don't re-execute the rendering pipeline)
+# ====================================================================
+
+def main():
+    # Names used by module-level helper functions (to3d, saturations_from)
+    # must live at module scope so those functions can find them when
+    # called from inside main(). Declaring them global here means main()'s
+    # assignments below populate the module namespace.
+    global Nx, Ny, Nz
+
+    args = parser.parse_args()
+
+    # Resolve --workers auto setting
+    import multiprocessing as _mp
+    if args.workers == 0:
+        _N_WORKERS = max(1, _mp.cpu_count() - 1)
+    else:
+        _N_WORKERS = max(1, args.workers)
+    print(f"Frame rendering: {'parallel' if _N_WORKERS > 1 else 'serial'} "
+          f"({_N_WORKERS} worker{'s' if _N_WORKERS > 1 else ''})")
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    if not HAS_H5:
+        print("NOTE: h5py not available — only NPZ snapshots can be read.")
+
+
+    # ======================================================================
+    # LOAD SNAPSHOTS  (HDF5 if available, else NPZ directory)
+    # ======================================================================
+    snap_dir = _resolve_snap_dir(args.input)
+
+    try:
+        meta, frames = scan_snapshots(snap_dir, skip=args.skip)
     except Exception as e:
-        print(f"  ({writer_name} failed: {e})")
-if not saved:
-    print("  ERROR: could not save Plot 2 animation")
-plt.close(fig2)
+        print(f"ERROR scanning snapshots: {e}")
+        sys.exit(1)
+
+    Nx = int(meta["Nx"]); Ny = int(meta["Ny"]); Nz = int(meta["Nz"])
+    Lx = float(meta["Lx"]); Ly = float(meta["Ly"]); Lz = float(meta["Lz"])
+    x_flat = meta["x"]; y_flat = meta["y"]; z_flat = meta["z"]
+    is_source_flat = meta["is_source"]
+    has_napl_q = meta["has_napl_q"]
+    # lex_perm: array that permutes per-particle data into lex order, or
+    # None if the data is already lex-ordered. Threaded through worker
+    # tasks so each frame's read is reordered consistently.
+    _lex_perm = meta.get("lex_perm")
+
+    print(f"  Grid: {Nx} x {Ny} x {Nz}    Domain: {Lx} x {Ly} x {Lz} m")
+    print(f"  Catalog: {len(frames)} frames.   "
+          f"t = [{frames[0]['time']:.1f}, {frames[-1]['time']:.1f}] s")
+    if not has_napl_q:
+        print("  NOTE: NAPL velocity not in snapshots — red NAPL streamlines will be skipped.")
+
+    # Memory budget hint: in the new streaming workflow each worker holds ONE
+    # snapshot's data at a time, not all of them. Peak per-worker memory is
+    # the raw snapshot size (positions + ~14 fields) plus matplotlib's
+    # rendering buffers (~3x raw).
+    _npart = Nx * Ny * Nz
+    _n_fields_per_snap = 14
+    _bytes_per_snap = _npart * _n_fields_per_snap * 8
+    _per_worker_estimate_mb = (_bytes_per_snap * 4) / (1024**2)
+    _total_estimate_mb = _per_worker_estimate_mb * _N_WORKERS
+    print(f"  Streaming workflow: each worker holds 1 snapshot at a time "
+          f"(~{_per_worker_estimate_mb:.0f} MB / worker).")
+    print(f"  Total in-flight memory: ~{_total_estimate_mb:.0f} MB across "
+          f"{_N_WORKERS} worker{'s' if _N_WORKERS > 1 else ''}.")
 
 
-print(f"\n{'='*70}")
-print("Done.")
-print(f"{'='*70}")
-print(f"Outputs in: {os.path.abspath(args.outdir)}/")
+    # ======================================================================
+    # GEOMETRY: reshape, infer source location
+    # ======================================================================
+    X3 = to3d(x_flat); Y3 = to3d(y_flat); Z3 = to3d(z_flat)
+    src3 = to3d(is_source_flat)
+
+    dx = Lx / (Nx - 1)
+    dy = Ly / (Ny - 1)
+    dz = Lz / (Nz - 1)
+
+    src_xs = X3[src3]; src_ys = Y3[src3]; src_zs = Z3[src3]
+    if len(src_xs) == 0:
+        print("WARNING: is_source mask is empty — defaulting slice indices to grid centre")
+        SRC_X0 = SRC_X1 = 0.5 * Lx
+        SRC_Y0 = SRC_Y1 = 0.5 * Ly
+        SRC_Z0 = SRC_Z1 = 0.5 * Lz
+        ix_src = Nx // 2; iy_src = Ny // 2
+    else:
+        SRC_X0, SRC_X1 = src_xs.min(), src_xs.max()
+        SRC_Y0, SRC_Y1 = src_ys.min(), src_ys.max()
+        SRC_Z0, SRC_Z1 = src_zs.min(), src_zs.max()
+        # Pad bbox by half a cell so the rectangle visually contains the source markers
+        SRC_X0 -= 0.5*dx; SRC_X1 += 0.5*dx
+        SRC_Y0 -= 0.5*dy; SRC_Y1 += 0.5*dy
+        SRC_Z0 -= 0.5*dz; SRC_Z1 += 0.5*dz
+        cx = 0.5 * (src_xs.min() + src_xs.max())
+        cy = 0.5 * (src_ys.min() + src_ys.max())
+        ix_src = max(0, min(int(round(cx / dx)), Nx - 1))
+        iy_src = max(0, min(int(round(cy / dy)), Ny - 1))
+
+    print(f"  Source bbox  x=[{SRC_X0:.2f},{SRC_X1:.2f}]  "
+          f"y=[{SRC_Y0:.2f},{SRC_Y1:.2f}]  z=[{SRC_Z0:.2f},{SRC_Z1:.2f}]")
+    print(f"  Slice indices: ix_src={ix_src} (x={X3[ix_src,0,0]:.2f}m), "
+          f"iy_src={iy_src} (y={Y3[0,iy_src,0]:.2f}m)")
+
+    x_axis = X3[:, 0, 0]
+    y_axis = Y3[0, :, 0]
+    z_axis = Z3[0, 0, :]
+
+
+    # ======================================================================
+    # Helper functions
+    # ======================================================================
+    print("\nBuilding Plot 1 (slice animation: particle scatter + streamlines) ...", flush=True)
+
+    # ── Helpers used in BOTH serial and parallel paths ────────────────────
+
+    _ref_fig, (_ref_yz, _ref_xz) = plt.subplots(1, 2, figsize=(15, 7),
+                                                  constrained_layout=True)
+
+    # Build the geom dict that travels everywhere (worker, serial path)
+    Y_yz_full, Z_yz_full = np.meshgrid(y_axis, z_axis, indexing="ij")
+    X_xz_full, Z_xz_full = np.meshgrid(x_axis, z_axis, indexing="ij")
+
+    geom = {
+        "Nx": Nx, "Ny": Ny, "Nz": Nz,
+        "Lx": Lx, "Ly": Ly, "Lz": Lz,
+        "ix_src": ix_src, "iy_src": iy_src,
+        "x_axis": x_axis, "y_axis": y_axis, "z_axis": z_axis,
+        "SRC_X0": SRC_X0, "SRC_X1": SRC_X1,
+        "SRC_Y0": SRC_Y0, "SRC_Y1": SRC_Y1,
+        "SRC_Z0": SRC_Z0, "SRC_Z1": SRC_Z1,
+        "yz_y_flat": Y_yz_full.ravel(), "yz_z_flat": Z_yz_full.ravel(),
+        "xz_x_flat": X_xz_full.ravel(), "xz_z_flat": Z_xz_full.ravel(),
+        "size_yz": None, "size_xz": None,   # filled in next
+    }
+    setup_axes_plot1(_ref_yz, _ref_xz, geom)
+    _ref_fig.canvas.draw()
+    geom["size_yz"] = marker_size_for(_ref_yz, dy)
+    geom["size_xz"] = marker_size_for(_ref_xz, dx)
+    plt.close(_ref_fig)
+
+
+    # ── Decide rendering path ────────────────────────────────────────────
+    n_frames = len(frames)
+    out_path1_base = os.path.join(args.outdir, "anim_slices_rgb")
+    saved = False
+
+    # Check for ffmpeg availability — required for the parallel path
+    _FFMPEG = shutil.which("ffmpeg")
+
+
+    _ENCODER_CANDIDATES = _build_encoder_candidates(args.quality, args.pix_fmt)
+    _use_parallel = (_N_WORKERS > 1) and (_FFMPEG is not None)
+    if _N_WORKERS > 1 and _FFMPEG is None:
+        print(f"  WARNING: ffmpeg not found on PATH; falling back to serial mode")
+
+    if _use_parallel:
+        # ─── PARALLEL PATH (streaming) ───────────────────────────────────
+        # Each worker opens one snapshot file, renders one PNG, releases
+        # memory, and returns. No data is held in the parent process between
+        # tasks (only the lightweight `frames` catalog).
+        with tempfile.TemporaryDirectory(prefix="sph_anim_", dir=args.outdir) as tmpdir:
+            _expected_npart = Nx * Ny * Nz
+            tasks = []
+            for idx, fr in enumerate(frames):
+                png_path = os.path.join(tmpdir, f"frame_{idx:06d}.png")
+                tasks.append((idx, fr["path"], fr["fmt"], _expected_npart, has_napl_q,
+                              _lex_perm,
+                              geom, png_path, args.dpi,
+                              args.alpha, args.stream_threshold, args.stream_density,
+                              args.stream_grid, not args.no_streamlines))
+
+            print(f"  Rendering {n_frames} frames with {_N_WORKERS} workers "
+                  f"(start method: {args.mp_start_method}) ...",
+                  flush=True)
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from concurrent.futures.process import BrokenProcessPool
+            try:
+                ctx = _mp.get_context(args.mp_start_method)
+            except ValueError:
+                print(f"  NOTE: '{args.mp_start_method}' start method unavailable; "
+                      f"falling back to 'spawn'")
+                ctx = _mp.get_context("spawn")
+
+            import time as _time
+            _t_render_start = _time.time()
+            completed = 0
+            _broken_pool = False
+            try:
+                with ProcessPoolExecutor(max_workers=_N_WORKERS,
+                                           mp_context=ctx) as pool:
+                    futures = [pool.submit(_render_frame_worker, t) for t in tasks]
+                    for fut in as_completed(futures):
+                        try:
+                            idx = fut.result()
+                            completed += 1
+                            if completed % max(1, n_frames // 10) == 0:
+                                elapsed = _time.time() - _t_render_start
+                                rate = completed / elapsed if elapsed > 0 else 0
+                                eta = (n_frames - completed) / rate if rate > 0 else 0
+                                print(f"    ... {completed}/{n_frames} frames "
+                                      f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
+                        except BrokenProcessPool as e:
+                            if not _broken_pool:
+                                print(f"\n    *** WORKER POOL BROKEN: {e}")
+                                print(f"    A worker process died unexpectedly "
+                                      f"(SIGBUS / SIGSEGV / SIGKILL).")
+                                print(f"    Likely causes:")
+                                print(f"      1. Out-of-memory: too little --mem for "
+                                      f"{_N_WORKERS} workers. Each worker needs roughly "
+                                      f"3-4x snapshot size (matplotlib intermediate buffers).")
+                                print(f"      2. fork+threaded-library mismatch: try "
+                                      f"--mp-start-method spawn (current: "
+                                      f"{args.mp_start_method})")
+                                print(f"      3. HDF5/Lustre I/O failure: stage data to "
+                                      f"$SLURM_TMPDIR (node-local) and retry")
+                                print(f"    Will fall back to serial rendering.\n")
+                                _broken_pool = True
+                        except Exception as e:
+                            print(f"    WORKER FAILED: {type(e).__name__}: {e}")
+                if _broken_pool:
+                    _use_parallel = False
+                else:
+                    _t_render = _time.time() - _t_render_start
+                    print(f"  Rendered {completed}/{n_frames} frames in {_t_render:.1f}s "
+                          f"({completed/_t_render:.1f} fr/s)", flush=True)
+            except BrokenProcessPool as e:
+                print(f"  ERROR: worker pool broken before any frames completed: {e}")
+                print(f"  Falling back to serial mode. Consider --workers 1 or more --mem.")
+                _use_parallel = False
+            except Exception as e:
+                print(f"  ERROR in parallel rendering: {e}; falling back to serial")
+                _use_parallel = False
+
+            if _use_parallel and completed > 0:
+                # ffmpeg stitch — try a chain of encoders, fall back through
+                # codecs and containers as needed.  The first one that actually
+                # produces a valid file wins.
+                available = _probe_ffmpeg_encoders(_FFMPEG)
+                if available:
+                    # Filter the candidate list to encoders we know are present.
+                    # If probing failed (empty set), try them all anyway — the
+                    # `-encoders` listing is informational; some builds may still
+                    # accept encoders that don't appear there.
+                    candidates = [(c, e, a) for (c, e, a) in _ENCODER_CANDIDATES
+                                  if c in available]
+                    if not candidates:
+                        print(f"  WARNING: none of the preferred encoders are available "
+                              f"in this ffmpeg build. Trying mpeg4 as last resort.")
+                        candidates = [("mpeg4", "mp4", ["-q:v", "5"])]
+                else:
+                    candidates = list(_ENCODER_CANDIDATES)
+
+                print(f"  Encoding video ({len(candidates)} encoder candidate"
+                      f"{'s' if len(candidates) > 1 else ''}) ...", flush=True)
+
+                input_pattern = os.path.join(tmpdir, "frame_%06d.png")
+                for codec, ext, extra in candidates:
+                    out_path = out_path1_base + "." + ext
+                    cmd = [_FFMPEG, "-y",
+                           "-framerate", str(args.fps),
+                           "-i", input_pattern,
+                           "-c:v", codec,
+                           *extra,
+                           "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                           out_path]
+                    _t_enc = _time.time()
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, text=True)
+                        _t_enc = _time.time() - _t_enc
+                        if proc.returncode == 0:
+                            print(f"  Saved {out_path}  "
+                                  f"(codec={codec}, encode: {_t_enc:.1f}s)")
+                            saved = True
+                            break
+                        else:
+                            # Show only the last meaningful error line
+                            err_tail = proc.stderr.strip().splitlines()[-1] \
+                                       if proc.stderr.strip() else "(no stderr)"
+                            print(f"  encoder '{codec}' failed: {err_tail}")
+                    except Exception as e:
+                        print(f"  encoder '{codec}' invocation failed: {e}")
+
+                if not saved:
+                    print(f"  All ffmpeg encoder candidates failed; "
+                          f"will fall back to serial mode (which can write GIF).")
+
+    if not saved:
+        # ─── SERIAL PATH (streaming PNG → ffmpeg or pillow GIF) ───────────
+        # User asked for serial OR the parallel path failed.  We still do
+        # streaming-PNGs-then-stitch instead of FuncAnimation, because
+        # FuncAnimation builds up all frames in memory before saving — which
+        # is exactly what we're trying to avoid.
+        print(f"  Rendering {n_frames} frames serially (streaming) ...", flush=True)
+        _expected_npart = Nx * Ny * Nz
+        with tempfile.TemporaryDirectory(prefix="sph_anim_", dir=args.outdir) as tmpdir:
+            # Render each frame to its own PNG, one at a time
+            import time as _time
+            _t_render_start = _time.time()
+            for idx, fr in enumerate(frames):
+                png_path = os.path.join(tmpdir, f"frame_{idx:06d}.png")
+                task = (idx, fr["path"], fr["fmt"], _expected_npart, has_napl_q,
+                        _lex_perm,
+                        geom, png_path, args.dpi,
+                        args.alpha, args.stream_threshold, args.stream_density,
+                        args.stream_grid, not args.no_streamlines)
+                try:
+                    _render_frame_worker(task)
+                except Exception as e:
+                    print(f"    frame {idx} ({fr['path']}): {type(e).__name__}: {e}")
+                    continue
+                if (idx + 1) % max(1, n_frames // 10) == 0:
+                    elapsed = _time.time() - _t_render_start
+                    rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                    eta = (n_frames - idx - 1) / rate if rate > 0 else 0
+                    print(f"    ... {idx+1}/{n_frames} frames "
+                          f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
+            _t_render = _time.time() - _t_render_start
+            print(f"  Rendered {n_frames} frames in {_t_render:.1f}s "
+                  f"({n_frames/_t_render:.1f} fr/s)", flush=True)
+
+            # Stitch PNGs into MP4 via ffmpeg, falling through encoder choices
+            if _FFMPEG is not None:
+                available = _probe_ffmpeg_encoders(_FFMPEG)
+                for ext, codec, encoder_args in _ENCODER_CANDIDATES:
+                    if available and codec not in available:
+                        continue
+                    full = out_path1_base + "." + ext
+                    cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
+                            "-i", os.path.join(tmpdir, "frame_%06d.png"),
+                            "-c:v", codec] + encoder_args + [full]
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+                        if proc.returncode == 0 and os.path.exists(full) \
+                                and os.path.getsize(full) > 1000:
+                            print(f"  Saved {full}  (codec={codec})")
+                            saved = True
+                            break
+                    except Exception as e:
+                        print(f"  encoder '{codec}' invocation failed: {e}")
+            # If ffmpeg unavailable, last resort: ImageMagick or pillow GIF from PNGs
+            if not saved:
+                try:
+                    from PIL import Image
+                    pngs = sorted(os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
+                                  if f.endswith(".png"))
+                    if pngs:
+                        imgs = [Image.open(p) for p in pngs]
+                        full = out_path1_base + ".gif"
+                        imgs[0].save(full, save_all=True, append_images=imgs[1:],
+                                      duration=int(1000/args.fps), loop=0)
+                        print(f"  Saved {full}  (pillow GIF fallback)")
+                        saved = True
+                except Exception as e:
+                    print(f"  GIF fallback failed: {e}")
+
+    if not saved:
+        print("  ERROR: could not save Plot 1 animation")
+
+
+
+    # ======================================================================
+    # PLOT 2: animated saturation profiles vs z at (x_src, y_src)
+    # ======================================================================
+    print("\nBuilding Plot 2 (saturation profiles animation, streaming) ...", flush=True)
+
+
+    geom_p2 = {
+        "ix_src": ix_src, "iy_src": iy_src,
+        "x_axis": x_axis, "y_axis": y_axis, "z_axis": z_axis,
+        "Nx": Nx, "Ny": Ny, "Nz": Nz,
+        "Lx": Lx, "Ly": Ly, "Lz": Lz,
+    }
+
+    out_path2_base = os.path.join(args.outdir, "anim_profile_xy")
+    saved2 = False
+    _expected_npart = Nx * Ny * Nz
+
+    if _use_parallel:
+        with tempfile.TemporaryDirectory(prefix="sph_p2_", dir=args.outdir) as tmpdir2:
+            tasks2 = []
+            for idx, fr in enumerate(frames):
+                png_path = os.path.join(tmpdir2, f"frame_{idx:06d}.png")
+                tasks2.append((idx, fr["path"], fr["fmt"], _expected_npart,
+                                has_napl_q, _lex_perm,
+                                geom_p2, png_path, args.dpi))
+
+            print(f"  Rendering {n_frames} frames with {_N_WORKERS} workers "
+                  f"(start method: {args.mp_start_method}) ...", flush=True)
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from concurrent.futures.process import BrokenProcessPool
+            try:
+                ctx = _mp.get_context(args.mp_start_method)
+            except ValueError:
+                ctx = _mp.get_context("spawn")
+
+            import time as _time
+            _t_render_start = _time.time()
+            completed2 = 0
+            _broken2 = False
+            try:
+                with ProcessPoolExecutor(max_workers=_N_WORKERS, mp_context=ctx) as pool:
+                    futures = [pool.submit(_render_plot2_frame_worker, t) for t in tasks2]
+                    for fut in as_completed(futures):
+                        try:
+                            idx = fut.result()
+                            completed2 += 1
+                            if completed2 % max(1, n_frames // 10) == 0:
+                                elapsed = _time.time() - _t_render_start
+                                rate = completed2 / elapsed if elapsed > 0 else 0
+                                eta = (n_frames - completed2) / rate if rate > 0 else 0
+                                print(f"    ... {completed2}/{n_frames} frames "
+                                      f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
+                        except BrokenProcessPool as e:
+                            if not _broken2:
+                                print(f"\n    *** WORKER POOL BROKEN (Plot 2): {e}")
+                                _broken2 = True
+                        except Exception as e:
+                            print(f"    WORKER FAILED: {type(e).__name__}: {e}")
+                if _broken2:
+                    _use_parallel_p2 = False
+                else:
+                    _t_render = _time.time() - _t_render_start
+                    print(f"  Rendered {completed2}/{n_frames} frames in "
+                          f"{_t_render:.1f}s ({completed2/_t_render:.1f} fr/s)",
+                          flush=True)
+                    # Stitch
+                    if _FFMPEG is not None:
+                        available = _probe_ffmpeg_encoders(_FFMPEG)
+                        for ext, codec, encoder_args in _ENCODER_CANDIDATES:
+                            if available and codec not in available:
+                                continue
+                            full = out_path2_base + "." + ext
+                            cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
+                                    "-i", os.path.join(tmpdir2, "frame_%06d.png"),
+                                    "-c:v", codec] + encoder_args + [full]
+                            try:
+                                proc = subprocess.run(cmd, capture_output=True,
+                                                       timeout=600)
+                                if proc.returncode == 0 and os.path.exists(full) \
+                                        and os.path.getsize(full) > 1000:
+                                    print(f"  Saved {full}  (codec={codec})")
+                                    saved2 = True
+                                    break
+                            except Exception as e:
+                                print(f"  encoder '{codec}' invocation failed: {e}")
+            except Exception as e:
+                print(f"  Plot 2 parallel error: {e}")
+
+    if not saved2:
+        # Streaming serial fallback for Plot 2
+        print(f"  Rendering {n_frames} frames serially ...", flush=True)
+        with tempfile.TemporaryDirectory(prefix="sph_p2_", dir=args.outdir) as tmpdir2:
+            import time as _time
+            _t_render_start = _time.time()
+            for idx, fr in enumerate(frames):
+                png_path = os.path.join(tmpdir2, f"frame_{idx:06d}.png")
+                task = (idx, fr["path"], fr["fmt"], _expected_npart,
+                        has_napl_q, _lex_perm,
+                        geom_p2, png_path, args.dpi)
+                try:
+                    _render_plot2_frame_worker(task)
+                except Exception as e:
+                    print(f"    frame {idx} ({fr['path']}): {type(e).__name__}: {e}")
+                    continue
+                if (idx + 1) % max(1, n_frames // 10) == 0:
+                    elapsed = _time.time() - _t_render_start
+                    rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                    eta = (n_frames - idx - 1) / rate if rate > 0 else 0
+                    print(f"    ... {idx+1}/{n_frames} frames "
+                          f"({rate:.1f} fr/s, ETA {eta:.0f}s)", flush=True)
+            _t_render = _time.time() - _t_render_start
+            print(f"  Rendered {n_frames} frames in {_t_render:.1f}s", flush=True)
+
+            if _FFMPEG is not None:
+                available = _probe_ffmpeg_encoders(_FFMPEG)
+                for ext, codec, encoder_args in _ENCODER_CANDIDATES:
+                    if available and codec not in available:
+                        continue
+                    full = out_path2_base + "." + ext
+                    cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
+                            "-i", os.path.join(tmpdir2, "frame_%06d.png"),
+                            "-c:v", codec] + encoder_args + [full]
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+                        if proc.returncode == 0 and os.path.exists(full) \
+                                and os.path.getsize(full) > 1000:
+                            print(f"  Saved {full}  (codec={codec})")
+                            saved2 = True
+                            break
+                    except Exception as e:
+                        print(f"  encoder '{codec}' invocation failed: {e}")
+            if not saved2:
+                try:
+                    from PIL import Image
+                    pngs = sorted(os.path.join(tmpdir2, f)
+                                  for f in os.listdir(tmpdir2) if f.endswith(".png"))
+                    if pngs:
+                        imgs = [Image.open(p) for p in pngs]
+                        full = out_path2_base + ".gif"
+                        imgs[0].save(full, save_all=True, append_images=imgs[1:],
+                                      duration=int(1000/args.fps), loop=0)
+                        print(f"  Saved {full}  (pillow GIF fallback)")
+                        saved2 = True
+                except Exception as e:
+                    print(f"  GIF fallback failed: {e}")
+
+    if not saved2:
+        print("  ERROR: could not save Plot 2 animation")
+
+
+    # ======================================================================
+    # STATIC FIGURE 1: 2x2 slice panels at 4 time points
+    # ======================================================================
+    print("\nBuilding static Figure 1 (slice panels at 4 time points) ...", flush=True)
+
+    _panel_indices = _pick_panel_indices(n_frames)
+    _panel_times_str = ", ".join(f"{frames[i]['time']:.1f}s" for i in _panel_indices)
+    print(f"  Selected frames: {_panel_indices}  (t = {_panel_times_str})")
+
+    # 2x2 layout with each panel containing the same YZ+XZ slice pair as Plot 1.
+    # Each panel is a sub-figure: we need a grid of 4 (rows) x 2 (cols) actually,
+    # or 2x2 with each cell holding two side-by-side subplots. The latter is
+    # what fits the description "4 panels each representing 4 moments". I use
+    # a 4x2 grid with shared row spacing — looks like 4 panels stacked.
+    # Actually to match "4 panels": a 2x2 layout where each panel is a single
+    # composite (YZ+XZ stacked vertically) makes the most sense visually.
+    # 4 rows (one per time point) x 2 cols (YZ slice | XZ slice).
+    # Each row's leftmost ylabel carries the panel time, so the time is
+    # both immediately visible and naturally aligned with its row.
+    n_panels = len(_panel_indices[:4])
+    fig_static1, axes_static1 = plt.subplots(
+        n_panels, 2, figsize=(13, 4.5 * n_panels), constrained_layout=True)
+    if n_panels == 1:
+        axes_static1 = np.atleast_2d(axes_static1)
+
+    fig_static1.suptitle(
+        "Saturation slices at 4 time points\n"
+        "(R=Sn, G=Sa, B=Sw)  +  water (blue) / NAPL (red) streamlines",
+        fontsize=13, fontweight="bold")
+
+    for panel_i, idx in enumerate(_panel_indices[:n_panels]):
+        ax_yz = axes_static1[panel_i, 0]
+        ax_xz = axes_static1[panel_i, 1]
+        fr = frames[idx]
+        try:
+            snap = read_one_snapshot(fr["path"], fr["fmt"], _expected_npart,
+                                      has_napl_q, _lex_perm)
+        except Exception as e:
+            ax_yz.text(0.5, 0.5, f"Failed to read\n{fr['path']}\n{e}",
+                       ha="center", va="center", transform=ax_yz.transAxes)
+            continue
+        setup_axes_plot1(ax_yz, ax_xz, geom)
+        fig_static1.canvas.draw()
+        _draw_plot1_into_axes(ax_yz, ax_xz, fig_static1, snap, geom,
+                               args.alpha, args.stream_threshold,
+                               args.stream_density, args.stream_grid,
+                               not args.no_streamlines)
+        # _draw_plot1_into_axes sets a per-frame suptitle on the figure;
+        # for the static figure we want our own overall suptitle instead,
+        # so re-set it after each draw (the last write wins, but they
+        # all set the same text).
+        fig_static1.suptitle(
+            "Saturation slices at 4 time points\n"
+            "(R=Sn, G=Sa, B=Sw)  +  water (blue) / NAPL (red) streamlines",
+            fontsize=13, fontweight="bold")
+        # Compact per-axes titles. Encode time in the ylabel of the left
+        # panel so it acts as a row label.
+        ax_yz.set_title(f"YZ at x={x_axis[ix_src]:.2f} m", fontsize=10)
+        ax_xz.set_title(f"XZ at y={y_axis[iy_src]:.2f} m", fontsize=10)
+        ax_yz.set_ylabel(
+            f"step {snap['step']}\nt = {format_dd_hh_mm_ss(snap['time'])}\n\nz [m]",
+            fontsize=10)
+        del snap
+
+    out_static1 = os.path.join(args.outdir, "static_slices_4panels.png")
+    fig_static1.savefig(out_static1, dpi=args.dpi)
+    plt.close(fig_static1)
+    print(f"  Saved {out_static1}")
+
+
+    # ======================================================================
+    # STATIC FIGURE 2: 2x2 saturation profile panels at 4 time points
+    # ======================================================================
+    print("\nBuilding static Figure 2 (profile panels at 4 time points) ...", flush=True)
+
+    fig_static2, axes2 = plt.subplots(2, 2, figsize=(13, 12), constrained_layout=True)
+    fig_static2.suptitle(
+        f"Saturation profiles vs z at (x={x_axis[ix_src]:.2f}, "
+        f"y={y_axis[iy_src]:.2f}) m  —  4 time points", fontsize=13)
+
+    for panel_i, idx in enumerate(_panel_indices[:4]):
+        ax = axes2.flat[panel_i]
+        fr = frames[idx]
+        try:
+            snap = read_one_snapshot(fr["path"], fr["fmt"], _expected_npart,
+                                      has_napl_q, _lex_perm)
+        except Exception as e:
+            ax.text(0.5, 0.5, f"Failed to read\n{fr['path']}\n{e}",
+                     ha="center", va="center", transform=ax.transAxes)
+            continue
+        _draw_plot2_into_axes(ax, snap, geom_p2)
+        ax.set_title(f"step {snap['step']:>6d},  "
+                      f"t = {format_dd_hh_mm_ss(snap['time'])}",
+                      fontsize=11)
+        del snap
+
+    # Fill any unused panels with a blank message (only when n_frames < 4)
+    for panel_i in range(len(_panel_indices), 4):
+        ax = axes2.flat[panel_i]
+        ax.text(0.5, 0.5, "(not enough frames)", ha="center", va="center",
+                 transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    out_static2 = os.path.join(args.outdir, "static_profiles_4panels.png")
+    fig_static2.savefig(out_static2, dpi=args.dpi)
+    plt.close(fig_static2)
+    print(f"  Saved {out_static2}")
+
+
+    print(f"\n{'='*70}")
+    print("Done.")
+    print(f"{'='*70}")
+    print(f"Outputs in: {os.path.abspath(args.outdir)}/")
+
+
+if __name__ == "__main__":
+    main()
