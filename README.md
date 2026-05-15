@@ -7,11 +7,11 @@ unsaturated porous medium. Built around the SPH framework of
 
 ## What it solves
 
-A coupled three-phase Darcy/Richards system on a uniform particle lattice:
+A coupled three-phase Darcy system on a uniform particle lattice:
 
-* **Water** pressure head `h_w(x, t)` evolves by the SPH form of Richards'
+* **Water** pressure head `h_w(x, t)` evolves by the SPH form of Darcy's
   equation, with hydraulic conductivity that depends on water and NAPL
-  saturations through Mualem–van Genuchten constitutive relations.
+  saturations through Van Genuchten constitutive relations.
 * **NAPL** saturation `S_n(x, t)` evolves by an advective transport
   equation driven by the NAPL phase pressure (water + capillary +
   buoyancy terms).
