@@ -78,7 +78,7 @@ _g_src.add_argument("--sn-source", type=float, default=0.80,
 _g_time = _parser.add_argument_group("Time integration")
 _g_time.add_argument("--n-steps", type=int, default=2000,
                       help="Maximum number of time steps")
-_g_time.add_argument("--cfl", type=float, default=0.25, help="CFL factor for stable dt")
+_g_time.add_argument("--cfl", type=float, default=0.1, help="CFL factor for stable dt")
 
 # --- I/O ---
 _g_io = _parser.add_argument_group("I/O cadence")
@@ -206,7 +206,7 @@ m_vG    = 1.0 - 1.0 / n_vG                    # Van Genuchten m
 g_a     = gamma_w / p_caw0                     # alpha_vG  [1/m]
 
 S_sat   = 1.0
-S_res   = 0.045
+S_res   = 0.02
 g_l     = 0.5          # Mualem pore-connectivity parameter
 
 # Specific storage  (paper Eq. 30)
@@ -1506,6 +1506,12 @@ def _morton3d(i, j, k):
             | (_spread_bits(np.asarray(k)) << np.int64(2)))
 
 
+# Z-order state: holds the inverse permutation so save_snapshot() can
+# un-reorder per-particle arrays back to canonical lex order on disk.
+# None means no Z-order is active (single-rank, --no-gpu-zorder, etc.).
+_ZORDER_INV_PERM = None
+
+
 def _apply_zorder_reorder():
     """Permute all per-particle arrays into Z-order. Operates on module
     globals, in place. Called once before GPU upload.
@@ -1522,6 +1528,7 @@ def _apply_zorder_reorder():
     global _idx_front_srcconf, _idx_back_srcconf
     global nbr_ptr, nbr_j, nbr_Fhat, nbr_gWx, nbr_gWy, nbr_gWz
     global idx_3d
+    global _ZORDER_INV_PERM
 
     print("Applying Z-order particle reordering ...", flush=True)
     _t0 = wall_time.time()
@@ -1638,6 +1645,13 @@ def _apply_zorder_reorder():
     new_idx_3d = np.full_like(idx_3d, -1)
     new_idx_3d[nonneg] = inv_perm[idx_3d[nonneg]]
     idx_3d = new_idx_3d
+
+    # Keep inv_perm around so save_snapshot() can un-reorder per-particle
+    # arrays back to canonical lex order before writing them to HDF5/NPZ.
+    # This keeps Z-order purely as an internal compute optimization — the
+    # on-disk format remains canonical so the postprocess and h5dump/HDFView
+    # see particles in their natural (i, j, k) sequence.
+    _ZORDER_INV_PERM = inv_perm.copy()
 
     print(f"  reordered {N_part} particles in {wall_time.time()-_t0:.1f}s")
 
@@ -1866,13 +1880,47 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
     encountered with single multi-GB HDF5 files on parallel filesystems
     (Lustre/GPFS). Each file is self-contained and independently readable.
 
+    If Z-order particle reordering was applied at startup (the default
+    GPU optimization), this function un-reorders all per-particle arrays
+    back to canonical lexicographic (i, j, k) order before writing — so
+    the on-disk format is identical to what the CPU script produces.
+    Downstream tools (postprocess script, h5dump, HDFView) don't need to
+    know that Z-order was used internally.
+
     The `fname` argument is kept for legacy interface compatibility but
     is ignored — the actual filename is derived from the step number.
 
     qx,qy,qz   : water Darcy velocity components
     qxn,qyn,qzn: NAPL  Darcy velocity components
     """
+    # If Z-order is active, un-reorder everything to lex order on disk.
+    # All arrays are simple gathers: arr_lex = arr_morton[inv_perm].
+    # Constant arrays (xp, yp, zp, ptype, is_source) use module globals;
+    # state and RHS arrays come in via parameters.
+    if _ZORDER_INV_PERM is not None:
+        ip = _ZORDER_INV_PERM
+        h_field    = h_field[ip]
+        Sn_field   = Sn_field[ip]
+        dhdt       = dhdt[ip]
+        dSndt      = dSndt[ip]
+        qx, qy, qz       = qx[ip],  qy[ip],  qz[ip]
+        qxn, qyn, qzn    = qxn[ip], qyn[ip], qzn[ip]
+        xp_s       = xp[ip]
+        yp_s       = yp[ip]
+        zp_s       = zp[ip]
+        ptype_s    = ptype[ip]
+        is_source_s = is_source[ip]
+    else:
+        xp_s, yp_s, zp_s = xp, yp, zp
+        ptype_s          = ptype
+        is_source_s      = is_source
+
+    # Derived element-wise quantities — compute AFTER the un-reorder so
+    # they end up in lex order automatically.
     Sw = compute_Sw_3ph(h_field, Sn_field)
+    kw = compute_kw_3ph(h_field, Sn_field)
+    kn = compute_kn_field(h_field, Sn_field)
+
     os.makedirs(SNAP_DIR, exist_ok=True)
 
     if HAS_H5:
@@ -1894,16 +1942,16 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
             f.attrs["H_u"]    = H_u
             f.attrs["H_d"]    = H_d
 
-            # Per-particle datasets at ROOT level
-            f.create_dataset("x",    data=xp)
-            f.create_dataset("y",    data=yp)
-            f.create_dataset("z",    data=zp)
+            # Per-particle datasets at ROOT level (now in lex order)
+            f.create_dataset("x",    data=xp_s)
+            f.create_dataset("y",    data=yp_s)
+            f.create_dataset("z",    data=zp_s)
             f.create_dataset("h",    data=h_field)
-            f.create_dataset("H",    data=h_field + zp)
+            f.create_dataset("H",    data=h_field + zp_s)
             f.create_dataset("Sn",   data=Sn_field)
             f.create_dataset("Sw",   data=Sw)
-            f.create_dataset("kw",   data=compute_kw_3ph(h_field, Sn_field))
-            f.create_dataset("kn",   data=compute_kn_field(h_field, Sn_field))
+            f.create_dataset("kw",   data=kw)
+            f.create_dataset("kn",   data=kn)
             f.create_dataset("dhdt", data=dhdt)
             f.create_dataset("dSndt", data=dSndt)
             f.create_dataset("qx",   data=qx)
@@ -1912,22 +1960,20 @@ def save_snapshot(fname, step, t, h_field, Sn_field, dhdt, dSndt,
             f.create_dataset("qxn",  data=qxn)
             f.create_dataset("qyn",  data=qyn)
             f.create_dataset("qzn",  data=qzn)
-            f.create_dataset("ptype", data=ptype)
-            f.create_dataset("is_source", data=is_source.astype(np.int8))
+            f.create_dataset("ptype", data=ptype_s)
+            f.create_dataset("is_source", data=is_source_s.astype(np.int8))
         os.replace(tmp_path, path)
     else:
         path = os.path.join(SNAP_DIR, f"step_{step:012d}.npz")
         np.savez_compressed(path,
             step=step, time_s=t, Nx=Nx, Ny=Ny, Nz=Nz, Lx=Lx, Ly=Ly, Lz=Lz,
             k_sat=k_sat, H_u=H_u, H_d=H_d,
-            x=xp, y=yp, z=zp, h=h_field, H=h_field + zp,
-            Sn=Sn_field, Sw=Sw,
-            kw=compute_kw_3ph(h_field, Sn_field),
-            kn=compute_kn_field(h_field, Sn_field),
+            x=xp_s, y=yp_s, z=zp_s, h=h_field, H=h_field + zp_s,
+            Sn=Sn_field, Sw=Sw, kw=kw, kn=kn,
             dhdt=dhdt, dSndt=dSndt,
             qx=qx, qy=qy, qz=qz,
             qxn=qxn, qyn=qyn, qzn=qzn,
-            ptype=ptype, is_source=is_source.astype(np.int8))
+            ptype=ptype_s, is_source=is_source_s.astype(np.int8))
 
 # NOTE: each snapshot is now an INDEPENDENT FILE in SNAP_DIR. Restart logic
 # removes future-of-checkpoint files via filesystem unlink — no h5repack needed.
@@ -1980,6 +2026,11 @@ def save_checkpoint(step, t, hw, Sn, time_log, l2_log, l2n_log,
         f.attrs["src_y0"]  = SRC_Y0; f.attrs["src_y1"] = SRC_Y1
         f.attrs["src_z0"]  = SRC_Z0; f.attrs["src_z1"] = SRC_Z1
         f.attrs["sn_source"] = SN_SOURCE
+        # Tag whether Z-order reordering was active when this checkpoint
+        # was saved. On restart the script will refuse to load a ckpt
+        # with a different Z-order state, because h_w/S_n in the file
+        # are in whatever array order was in use at save time.
+        f.attrs["zorder_applied"] = (_ZORDER_INV_PERM is not None)
 
         # Field arrays (compressed)
         ckw = dict(compression="gzip", compression_opts=4)
@@ -2058,6 +2109,21 @@ def load_latest_checkpoint():
                          + "\n  ".join(mismatches)
                          + "\n  Either match these settings on the command line, "
                          + "delete the checkpoint, or use a different --outdir.")
+
+            # Z-order compatibility check: h_w / S_n on disk are in
+            # whatever array order was active at save time. Restarting
+            # with a different Z-order state would silently corrupt
+            # the per-particle correspondence.
+            ck_zorder = bool(f.attrs.get("zorder_applied", False))
+            run_zorder = not args.no_gpu_zorder
+            if ck_zorder != run_zorder:
+                sys.exit(
+                    f"ERROR: Z-order mismatch in checkpoint ({path}):\n"
+                    f"  checkpoint was saved with zorder_applied={ck_zorder}\n"
+                    f"  current run has zorder_applied={run_zorder}\n"
+                    f"  Either re-run with {'--no-gpu-zorder' if ck_zorder else ''}"
+                    f" matching the checkpoint, delete the checkpoint, or use\n"
+                    f"  a different --outdir.")
 
             d = {
                 "step":    int(f.attrs["step"]),
@@ -2318,6 +2384,37 @@ print("  done.")
 
 
 # ======================================================================
+# 13b. UN-REORDER FROM Z-ORDER FOR FINAL PLOTTING
+# ======================================================================
+# If Z-order was applied at setup, the per-particle arrays are still in
+# Morton order in memory. The plotting code below uses reshape(Nx,Ny,Nz)
+# and slice extraction, which both assume LEX order — otherwise the
+# extracted axes are non-monotonic and streamplot complains with
+# "'x' must be strictly increasing".
+#
+# save_snapshot() already writes the FILE in lex order (via inv_perm),
+# but the live module globals it leaves alone, so we un-reorder them
+# here once. Plotting code below sees canonical (i*Ny*Nz + j*Nz + k)
+# ordering and runs unchanged.
+#
+# This is a no-op when --no-gpu-zorder is used or Z-order wasn't applied.
+if _ZORDER_INV_PERM is not None:
+    print("Un-reordering arrays from Z-order to lex order for final plotting ...",
+          flush=True)
+    ip = _ZORDER_INV_PERM
+    xp = xp[ip]; yp = yp[ip]; zp = zp[ip]
+    h_w = h_w[ip]; S_n = S_n[ip]
+    qx_final  = qx_final[ip];  qy_final  = qy_final[ip];  qz_final  = qz_final[ip]
+    qxn_final = qxn_final[ip]; qyn_final = qyn_final[ip]; qzn_final = qzn_final[ip]
+    ptype = ptype[ip]; is_source = is_source[ip]
+    # Rebuild idx_3d in canonical lex form (was Z-order index after reorder)
+    idx_3d = np.arange(N_part, dtype=np.int64).reshape(Nx, Ny, Nz)
+    # Each Sn snapshot stored during the main loop is also in Z-order;
+    # reorder them all so the per-time profile plot reads them correctly.
+    Sn_history = [(_s, _t, _sn[ip]) for (_s, _t, _sn) in Sn_history]
+
+
+# ======================================================================
 # 14.  POST-PROCESSING  &  FIGURES   (3D)
 # ======================================================================
 import matplotlib
@@ -2338,8 +2435,11 @@ Sa_3  = np.clip(1.0 - Sw_3 - Sn_3, 0, 1)
 qx3   = to3d(qx_final); qy3 = to3d(qy_final); qz3 = to3d(qz_final)
 qm3   = np.sqrt(qx3**2 + qy3**2 + qz3**2)
 
-qxn_f, qyn_f, qzn_f = compute_darcy_velocity_napl(h_w, S_n)
-qxn3 = to3d(qxn_f); qyn3 = to3d(qyn_f); qzn3 = to3d(qzn_f)
+# Use the NAPL velocity already computed above (line ~2378). The previous
+# version re-computed compute_darcy_velocity_napl here, which (a) was
+# redundant, and (b) after the un-reorder above would use lex-order arrays
+# with Z-order neighbour lists — which would silently produce nonsense.
+qxn3 = to3d(qxn_final); qyn3 = to3d(qyn_final); qzn3 = to3d(qzn_final)
 qmn3 = np.sqrt(qxn3**2 + qyn3**2 + qzn3**2)
 
 # Slice indices: at NAPL source center
