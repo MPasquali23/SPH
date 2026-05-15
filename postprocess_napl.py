@@ -813,6 +813,91 @@ def _probe_ffmpeg_encoders(ffmpeg_path):
         return set()
 
 
+def _stitch_pngs_to_video(ffmpeg_path, png_dir, out_base, fps,
+                          encoder_candidates, png_pattern="frame_%06d.png"):
+    """Stitch a directory of numbered PNGs into a video.
+
+    Tries each entry from encoder_candidates in order (tuples of
+    (codec, ext, extra_args)). The first one that produces a valid file
+    wins. Includes the `-vf pad=ceil(iw/2)*2:ceil(ih/2)*2` filter, required
+    by libx264 with yuv420p when frame dimensions aren't even.
+
+    Returns (success, output_path) — output_path is None on failure.
+    Prints progress and the last line of ffmpeg's stderr on per-encoder
+    failure, so the user sees WHY a candidate didn't work.
+
+    Used by both Plot 1 (slice animation) and Plot 2 (profile animation).
+    """
+    if ffmpeg_path is None:
+        return False, None
+
+    available = _probe_ffmpeg_encoders(ffmpeg_path)
+    if available:
+        candidates = [(c, e, a) for (c, e, a) in encoder_candidates
+                      if c in available]
+        if not candidates:
+            print(f"  WARNING: none of the preferred encoders are available "
+                  f"in this ffmpeg build. Trying mpeg4 as last resort.")
+            candidates = [("mpeg4", "mp4", ["-q:v", "5"])]
+    else:
+        # Probing returned nothing — try them all anyway (some builds don't
+        # advertise encoders in the standard format).
+        candidates = list(encoder_candidates)
+
+    print(f"  Encoding video ({len(candidates)} encoder candidate"
+          f"{'s' if len(candidates) > 1 else ''}) ...", flush=True)
+
+    input_pattern = os.path.join(png_dir, png_pattern)
+    import time as _time
+    for codec, ext, extra in candidates:
+        out_path = out_base + "." + ext
+        cmd = [ffmpeg_path, "-y",
+               "-framerate", str(fps),
+               "-i", input_pattern,
+               "-c:v", codec,
+               *extra,
+               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+               out_path]
+        _t_enc = _time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=600)
+            _t_enc = _time.time() - _t_enc
+            if (proc.returncode == 0
+                    and os.path.exists(out_path)
+                    and os.path.getsize(out_path) > 1000):
+                print(f"  Saved {out_path}  "
+                      f"(codec={codec}, encode: {_t_enc:.1f}s)")
+                return True, out_path
+            # Show the last meaningful stderr line so user can diagnose
+            err_tail = (proc.stderr.strip().splitlines()[-1]
+                        if proc.stderr.strip() else "(no stderr)")
+            print(f"  encoder '{codec}' failed: {err_tail}")
+        except Exception as e:
+            print(f"  encoder '{codec}' invocation failed: {e}")
+
+    return False, None
+
+
+def _stitch_pngs_to_gif(png_dir, out_base, fps, png_pattern_glob="*.png"):
+    """Last-resort GIF fallback via Pillow. Returns (success, output_path)."""
+    try:
+        from PIL import Image
+        import glob as _g
+        pngs = sorted(_g.glob(os.path.join(png_dir, png_pattern_glob)))
+        if not pngs:
+            return False, None
+        imgs = [Image.open(p) for p in pngs]
+        out_path = out_base + ".gif"
+        imgs[0].save(out_path, save_all=True, append_images=imgs[1:],
+                      duration=int(1000 / fps), loop=0)
+        print(f"  Saved {out_path}  (pillow GIF fallback)")
+        return True, out_path
+    except Exception as e:
+        print(f"  GIF fallback failed: {e}")
+        return False, None
+
+
 # Quality-preset → encoder argument mapping.
 # CRF (Constant Rate Factor) is x264/x265's quality control: lower = better.
 # 18 is "visually lossless" for typical content; for sharp scientific viz with
@@ -1182,54 +1267,12 @@ def main():
                 _use_parallel = False
 
             if _use_parallel and completed > 0:
-                # ffmpeg stitch — try a chain of encoders, fall back through
-                # codecs and containers as needed.  The first one that actually
-                # produces a valid file wins.
-                available = _probe_ffmpeg_encoders(_FFMPEG)
-                if available:
-                    # Filter the candidate list to encoders we know are present.
-                    # If probing failed (empty set), try them all anyway — the
-                    # `-encoders` listing is informational; some builds may still
-                    # accept encoders that don't appear there.
-                    candidates = [(c, e, a) for (c, e, a) in _ENCODER_CANDIDATES
-                                  if c in available]
-                    if not candidates:
-                        print(f"  WARNING: none of the preferred encoders are available "
-                              f"in this ffmpeg build. Trying mpeg4 as last resort.")
-                        candidates = [("mpeg4", "mp4", ["-q:v", "5"])]
-                else:
-                    candidates = list(_ENCODER_CANDIDATES)
-
-                print(f"  Encoding video ({len(candidates)} encoder candidate"
-                      f"{'s' if len(candidates) > 1 else ''}) ...", flush=True)
-
-                input_pattern = os.path.join(tmpdir, "frame_%06d.png")
-                for codec, ext, extra in candidates:
-                    out_path = out_path1_base + "." + ext
-                    cmd = [_FFMPEG, "-y",
-                           "-framerate", str(args.fps),
-                           "-i", input_pattern,
-                           "-c:v", codec,
-                           *extra,
-                           "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                           out_path]
-                    _t_enc = _time.time()
-                    try:
-                        proc = subprocess.run(cmd, capture_output=True, text=True)
-                        _t_enc = _time.time() - _t_enc
-                        if proc.returncode == 0:
-                            print(f"  Saved {out_path}  "
-                                  f"(codec={codec}, encode: {_t_enc:.1f}s)")
-                            saved = True
-                            break
-                        else:
-                            # Show only the last meaningful error line
-                            err_tail = proc.stderr.strip().splitlines()[-1] \
-                                       if proc.stderr.strip() else "(no stderr)"
-                            print(f"  encoder '{codec}' failed: {err_tail}")
-                    except Exception as e:
-                        print(f"  encoder '{codec}' invocation failed: {e}")
-
+                # ffmpeg stitch via shared helper (so Plot 1 and Plot 2 use
+                # the exact same encoder fallback logic — no chance of one
+                # path silently misbehaving while the other works).
+                saved, _ = _stitch_pngs_to_video(
+                    _FFMPEG, tmpdir, out_path1_base, args.fps,
+                    _ENCODER_CANDIDATES)
                 if not saved:
                     print(f"  All ffmpeg encoder candidates failed; "
                           f"will fall back to serial mode (which can write GIF).")
@@ -1268,40 +1311,13 @@ def main():
             print(f"  Rendered {n_frames} frames in {_t_render:.1f}s "
                   f"({n_frames/_t_render:.1f} fr/s)", flush=True)
 
-            # Stitch PNGs into MP4 via ffmpeg, falling through encoder choices
-            if _FFMPEG is not None:
-                available = _probe_ffmpeg_encoders(_FFMPEG)
-                for ext, codec, encoder_args in _ENCODER_CANDIDATES:
-                    if available and codec not in available:
-                        continue
-                    full = out_path1_base + "." + ext
-                    cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
-                            "-i", os.path.join(tmpdir, "frame_%06d.png"),
-                            "-c:v", codec] + encoder_args + [full]
-                    try:
-                        proc = subprocess.run(cmd, capture_output=True, timeout=600)
-                        if proc.returncode == 0 and os.path.exists(full) \
-                                and os.path.getsize(full) > 1000:
-                            print(f"  Saved {full}  (codec={codec})")
-                            saved = True
-                            break
-                    except Exception as e:
-                        print(f"  encoder '{codec}' invocation failed: {e}")
-            # If ffmpeg unavailable, last resort: ImageMagick or pillow GIF from PNGs
+            # Stitch PNGs into video via shared helper
+            saved, _ = _stitch_pngs_to_video(
+                _FFMPEG, tmpdir, out_path1_base, args.fps,
+                _ENCODER_CANDIDATES)
+            # If ffmpeg unavailable or all encoders failed: pillow GIF
             if not saved:
-                try:
-                    from PIL import Image
-                    pngs = sorted(os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
-                                  if f.endswith(".png"))
-                    if pngs:
-                        imgs = [Image.open(p) for p in pngs]
-                        full = out_path1_base + ".gif"
-                        imgs[0].save(full, save_all=True, append_images=imgs[1:],
-                                      duration=int(1000/args.fps), loop=0)
-                        print(f"  Saved {full}  (pillow GIF fallback)")
-                        saved = True
-                except Exception as e:
-                    print(f"  GIF fallback failed: {e}")
+                saved, _ = _stitch_pngs_to_gif(tmpdir, out_path1_base, args.fps)
 
     if not saved:
         print("  ERROR: could not save Plot 1 animation")
@@ -1373,26 +1389,11 @@ def main():
                     print(f"  Rendered {completed2}/{n_frames} frames in "
                           f"{_t_render:.1f}s ({completed2/_t_render:.1f} fr/s)",
                           flush=True)
-                    # Stitch
-                    if _FFMPEG is not None:
-                        available = _probe_ffmpeg_encoders(_FFMPEG)
-                        for ext, codec, encoder_args in _ENCODER_CANDIDATES:
-                            if available and codec not in available:
-                                continue
-                            full = out_path2_base + "." + ext
-                            cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
-                                    "-i", os.path.join(tmpdir2, "frame_%06d.png"),
-                                    "-c:v", codec] + encoder_args + [full]
-                            try:
-                                proc = subprocess.run(cmd, capture_output=True,
-                                                       timeout=600)
-                                if proc.returncode == 0 and os.path.exists(full) \
-                                        and os.path.getsize(full) > 1000:
-                                    print(f"  Saved {full}  (codec={codec})")
-                                    saved2 = True
-                                    break
-                            except Exception as e:
-                                print(f"  encoder '{codec}' invocation failed: {e}")
+                    # Stitch via shared helper (same encoder fallback chain
+                    # as Plot 1 — keeps both animations in sync)
+                    saved2, _ = _stitch_pngs_to_video(
+                        _FFMPEG, tmpdir2, out_path2_base, args.fps,
+                        _ENCODER_CANDIDATES)
             except Exception as e:
                 print(f"  Plot 2 parallel error: {e}")
 
@@ -1421,38 +1422,12 @@ def main():
             _t_render = _time.time() - _t_render_start
             print(f"  Rendered {n_frames} frames in {_t_render:.1f}s", flush=True)
 
-            if _FFMPEG is not None:
-                available = _probe_ffmpeg_encoders(_FFMPEG)
-                for ext, codec, encoder_args in _ENCODER_CANDIDATES:
-                    if available and codec not in available:
-                        continue
-                    full = out_path2_base + "." + ext
-                    cmd = [_FFMPEG, "-y", "-framerate", str(args.fps),
-                            "-i", os.path.join(tmpdir2, "frame_%06d.png"),
-                            "-c:v", codec] + encoder_args + [full]
-                    try:
-                        proc = subprocess.run(cmd, capture_output=True, timeout=600)
-                        if proc.returncode == 0 and os.path.exists(full) \
-                                and os.path.getsize(full) > 1000:
-                            print(f"  Saved {full}  (codec={codec})")
-                            saved2 = True
-                            break
-                    except Exception as e:
-                        print(f"  encoder '{codec}' invocation failed: {e}")
+            # Stitch via shared helper
+            saved2, _ = _stitch_pngs_to_video(
+                _FFMPEG, tmpdir2, out_path2_base, args.fps,
+                _ENCODER_CANDIDATES)
             if not saved2:
-                try:
-                    from PIL import Image
-                    pngs = sorted(os.path.join(tmpdir2, f)
-                                  for f in os.listdir(tmpdir2) if f.endswith(".png"))
-                    if pngs:
-                        imgs = [Image.open(p) for p in pngs]
-                        full = out_path2_base + ".gif"
-                        imgs[0].save(full, save_all=True, append_images=imgs[1:],
-                                      duration=int(1000/args.fps), loop=0)
-                        print(f"  Saved {full}  (pillow GIF fallback)")
-                        saved2 = True
-                except Exception as e:
-                    print(f"  GIF fallback failed: {e}")
+                saved2, _ = _stitch_pngs_to_gif(tmpdir2, out_path2_base, args.fps)
 
     if not saved2:
         print("  ERROR: could not save Plot 2 animation")
@@ -1518,7 +1493,7 @@ def main():
         ax_yz.set_title(f"YZ at x={x_axis[ix_src]:.2f} m", fontsize=10)
         ax_xz.set_title(f"XZ at y={y_axis[iy_src]:.2f} m", fontsize=10)
         ax_yz.set_ylabel(
-            f"step {snap['step']}\nt = {format_dd_hh_mm_ss(snap['time'])}\n\nz [m]",
+            f"step {snap['step']}\nt = {format_time(snap['time'])}\n\nz [m]",
             fontsize=10)
         del snap
 
@@ -1550,7 +1525,7 @@ def main():
             continue
         _draw_plot2_into_axes(ax, snap, geom_p2)
         ax.set_title(f"step {snap['step']:>6d},  "
-                      f"t = {format_dd_hh_mm_ss(snap['time'])}",
+                      f"t = {format_time(snap['time'])}",
                       fontsize=11)
         del snap
 
