@@ -64,7 +64,7 @@ propagate via the second pass, so no explicit diagonal communication).
 Activate with the conventional launch:
 
 ```bash
-mpirun -np 16 python sph_seepage_napl.py --nx 101 --ny 101 --nz 101 ...
+mpirun -np 16 python sph_seepage_napl_MPI.py --nx 101 --ny 101 --nz 101 ...
 ```
 
 The script picks `(Px, Py)` automatically to match domain aspect ratio;
@@ -239,7 +239,7 @@ export LD_LIBRARY_PATH=/usr/lib64:$LD_LIBRARY_PATH
 source "$CONDA_PREFIX/etc/profile.d/conda.sh"
 conda activate cuda_env
 
-python sph_seepage_napl_gpu.py \
+python sph_seepage_napl_gpu_zorder.py \
     --nx 201 --ny 201 --nz 201 \
     --n-steps 500000 \
     --snapshot-every 1000 \
