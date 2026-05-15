@@ -368,7 +368,7 @@ module load hdf5/1.10.5
 module load cuda/12.4.1
 module load miniconda3
 conda create -n env_name numpy scipy matplotlib numba h5py \
-    mpi4py pillow -c conda-forge
+    numba-cuda mpi4py pillow ffmpeg -c conda-forge
 conda activate env_name
 # CUDA support: install cudatoolkit matching your driver
 ```
